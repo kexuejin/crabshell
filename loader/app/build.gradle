@@ -1,0 +1,62 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.kapp.shell'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.kapp.shell"
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+    
+    // Define the location of the compiled native library
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ['src/main/jniLibs']
+        }
+    }
+}
+
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'com.google.android.material:material:1.11.0'
+    testImplementation 'junit:junit:4.13.2'
+    androidTestImplementation 'androidx.test.ext:junit:1.1.5'
+    androidTestImplementation 'androidx.test.espresso:espresso-core:3.5.1'
+}
+
+// Task to build Rust library
+tasks.register('cargoBuild', Exec) {
+    // Determine the target architecture. For simplicity, we create a fat APK or split per ABI.
+    // Here we assume a single target for demonstration or iterate all.
+    // You would typically use cargo-ndk here.
+    environment 'PATH', "${System.env.PATH}:${System.env.HOME}/.cargo/bin"
+    environment 'ANDROID_NDK_HOME', "${System.env.HOME}/Library/Android/sdk/ndk/26.0.10792818"
+    commandLine 'cargo', 'ndk', '-t', 'arm64-v8a', '-t', 'armeabi-v7a', '-t', 'x86_64', '-o', 'src/main/jniLibs', 'build', '--release'
+    workingDir 'src/main/rust'
+    
+    // Fail gracefully if cargo is not found (packer tool logic handles this communication)
+    ignoreExitValue = true
+}
+
+// Hook cargo build into the build process
+// preBuild.dependsOn cargoBuild 
+// Commented out to prevent build failure during scaffold if Rust is missing

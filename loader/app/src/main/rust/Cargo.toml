@@ -1,0 +1,13 @@
+[package]
+name = "shell"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+jni = "0.21"
+aes-gcm = "0.10"
+# log = "0.4"
+# android_logger = "0.13" # Optional for logging

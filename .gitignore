@@ -1,0 +1,58 @@
+# Rust
+target/
+**/target/
+Cargo.lock
+**/*.rs.bk
+
+# Android
+.gradle/
+.idea/
+build/
+**/build/
+local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+*.iml
+*.ide
+*.apk
+*.ap_
+*.dex
+*.idsig
+*.so
+.DS_Store
+
+# Generated source
+**/config.rs
+**/strings_config.rs
+
+# Native outputs
+jniLibs/
+**/jniLibs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Logs and Temp folders
+*_decoded/
+*_decoded_*/
+temp_dir/
+packer_output*
+pid_*_logs/
+
+# Logs and Temp files
+*.txt
+*.log
+*.bin
+sample_manifest.xml
+resources_*.txt
+
+# Output
+output/
+kapp_payload.bin
+protected.apk
+app-release-unsigned.apk

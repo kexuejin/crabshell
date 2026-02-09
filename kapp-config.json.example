@@ -1,0 +1,8 @@
+{
+    "target": "path/to/my-app.apk",
+    "output": "protected.apk",
+    "keystore": "my-release-key.jks",
+    "ks_pass": "secret-password",
+    "key_alias": "my-alias",
+    "skip_build": false
+}
