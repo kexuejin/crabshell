@@ -23,9 +23,8 @@ ANDROID_EXPORTED = f"{{{ANDROID_NS}}}exported"
 ANDROID_INIT_ORDER = f"{{{ANDROID_NS}}}initOrder"
 
 
-def generate_config(rust_dir, key_bytes):
-    config_path = os.path.join(rust_dir, "src", "config.rs")
-    
+def generate_config(config_path: str, key_bytes: bytes, payload_hash: bytes = None, signature_hash: bytes = None):
+    # key_bytes is the real key (32 bytes)
     # Generate a random mask (KEY_PART_1)
     mask_bytes = os.urandom(32)
     
@@ -91,6 +90,9 @@ pub fn get_aes_key() -> [u8; 32] {{
     }}
     key
 }}
+
+pub const PAYLOAD_HASH: [u8; 32] = [{", ".join([f"0x{b:02x}" for b in (payload_hash or b'\x00'*32)])}];
+pub const EXPECTED_SIGNATURE_HASH: [u8; 32] = [{", ".join([f"0x{b:02x}" for b in (signature_hash or b'\x00'*32)])}];
 """
     output_dir = os.path.dirname(config_path)
     os.makedirs(output_dir, exist_ok=True)
@@ -103,6 +105,27 @@ pub fn get_aes_key() -> [u8; 32] {{
         
     print(f"Generated config -> {config_path}")
     print(f"Generated strings -> {strings_config_path}")
+
+def get_apk_signature_hash(apk_path: str) -> Optional[bytes]:
+    apksigner = find_android_build_tool("apksigner")
+    if not apksigner:
+        print("Warning: apksigner not found, cannot get signature hash.")
+        return None
+    
+    try:
+        output = subprocess.check_output([apksigner, "verify", "--print-certs", apk_path], stderr=subprocess.STDOUT).decode()
+        for line in output.splitlines():
+            if "SHA-256 digest:" in line:
+                hash_str = line.split(":", 1)[1].strip()
+                return bytes.fromhex(hash_str)
+    except Exception as e:
+        print(f"Warning: Failed to get signature hash: {e}")
+    return None
+
+def calculate_sha256(file_path: str) -> bytes:
+    import hashlib
+    with open(file_path, "rb") as f:
+        return hashlib.sha256(f.read()).digest()
 
 
 def ensure_tool_exists(tool: str):
@@ -489,6 +512,8 @@ def pack_apk(
     keep_prefixes: list[str],
     keep_libs: list[str],
     encrypt_assets: list[str],
+    signing_config: Tuple[str, str, str],
+    key_bytes: bytes,
     resources_arsc: Optional[str] = None,
 ):
     packer_bin = os.path.join(PACKER_DIR, "target", "release", "packer")
@@ -524,10 +549,58 @@ def pack_apk(
     for keep_lib in keep_libs:
         cmd.extend(["--keep-lib", keep_lib])
 
-    for asset_pattern in encrypt_assets:
-        cmd.extend(["--encrypt-asset", asset_pattern])
+    if encrypt_assets:
+        for asset_pattern in encrypt_assets:
+            cmd.extend(["--encrypt-asset", asset_pattern])
 
-    subprocess.check_call(cmd)
+    payload_path = os.path.join(os.path.dirname(output_apk), "kapp_payload.bin")
+    
+    # Phase 1: Generate payload only
+    print("Phase 1: Generating payload for hashing...")
+    payload_cmd = cmd + ["--payload-out", payload_path]
+    subprocess.check_call(payload_cmd)
+    
+    payload_hash = calculate_sha256(payload_path)
+    print(f"Payload hash: {payload_hash.hex()}")
+    
+    # Get signing config hash
+    signature_hash = None
+    keystore, ks_pass, key_alias = signing_config
+    if keystore and os.path.exists(keystore):
+        try:
+            # We can't use apksigner verify on a keystore directly easily, 
+            # but we can use keytool to get the cert hash.
+            keytool = shutil.which("keytool")
+            if keytool:
+                out = subprocess.check_output([
+                    keytool, "-list", "-v", 
+                    "-keystore", keystore, 
+                    "-storepass", ks_pass, 
+                    "-alias", key_alias
+                ]).decode()
+                for line in out.splitlines():
+                    if "SHA256:" in line:
+                        hash_str = line.split(":", 1)[1].strip().replace(":", "")
+                        signature_hash = bytes.fromhex(hash_str)
+                        break
+        except Exception as e:
+            print(f"Warning: Failed to get signature hash from keystore: {e}")
+
+    if not signature_hash:
+        print("Warning: Could not determine signature hash. Using dummy value.")
+        signature_hash = b'\x00' * 32
+
+    # Re-generate configs with hashes
+    generate_config(os.path.join(RUST_SHELL_DIR, "src", "config.rs"), key_bytes, payload_hash, signature_hash)
+    generate_config(os.path.join(PACKER_DIR, "src", "config.rs"), key_bytes, payload_hash, signature_hash)
+    
+    # Re-build shell with new config
+    build_shell()
+    
+    # Phase 2: Final pack using pre-generated payload
+    print("Phase 2: Final packing...")
+    final_cmd = cmd + ["--payload-in", payload_path]
+    subprocess.check_call(final_cmd)
 
 
 def sign_apk(apk_path, keystore, ks_pass, key_alias):
@@ -648,8 +721,9 @@ def main():
         os.makedirs(output_parent, exist_ok=True)
 
     key_bytes = secrets.token_bytes(32)
-    generate_config(RUST_SHELL_DIR, key_bytes)
-    generate_config(PACKER_DIR, key_bytes)
+    # Initial config generation for packer build
+    generate_config(os.path.join(RUST_SHELL_DIR, "src", "config.rs"), key_bytes)
+    generate_config(os.path.join(PACKER_DIR, "src", "config.rs"), key_bytes)
 
     with tempfile.TemporaryDirectory(prefix="kapp-") as temp_dir:
         decoded_dir = os.path.join(temp_dir, "target_decoded")
@@ -670,45 +744,31 @@ def main():
              manual_keep_classes = [manual_keep_classes]
         keep_classes.extend(manual_keep_classes)
         
-        # We no longer automatically extract prefixes as it's too broad.
-        # keep_prefixes = extract_keep_prefixes(keep_classes)
         keep_prefixes = []
-        
-        # Add essential startup prefixes for Kid app only if explicitly needed
-        if "Kid" in target:
-            # We used to add more here, but let's be minimal to ensure encryption works.
-            # Dagger often spans many DEXs, so we'll just keep the classes for now.
-            pass
         manual_keep_prefixes = args.keep_prefix or config.get("keep_prefix", [])
         if isinstance(manual_keep_prefixes, str):
             manual_keep_prefixes = [manual_keep_prefixes]
         keep_prefixes.extend(manual_keep_prefixes)
-        if keep_classes:
-            print(f"Keeping startup classes in plaintext dex: {keep_classes}")
-        if keep_prefixes:
-            print(f"Keeping startup prefixes in plaintext dex: {keep_prefixes}")
-            
+        
         keep_libs = args.keep_lib or config.get("keep_lib", [])
         if isinstance(keep_libs, str):
             keep_libs = [keep_libs]
-        # Always keep MMKV if present as it's common for early startup
         if "mmkv" not in keep_libs:
             keep_libs.append("mmkv")
             
-        if keep_libs:
-            print(f"Keeping early startup libraries in plaintext: {keep_libs}")
-
         encrypt_assets = args.encrypt_asset or config.get("encrypt_asset", [])
         if isinstance(encrypt_assets, str):
             encrypt_assets = [encrypt_assets]
 
-        pack_apk(target, output, bootstrap_apk, patched_manifest, keep_classes, keep_prefixes, keep_libs, encrypt_assets, resources_arsc)
-
-    if no_sign:
-        print("Skipping signing (--no-sign). Output APK may fail to install.")
-    else:
         signing_keystore, signing_ks_pass, signing_alias = resolve_signing(keystore, ks_pass, key_alias)
-        sign_apk(output, signing_keystore, signing_ks_pass, signing_alias)
+        
+        pack_apk(target, output, bootstrap_apk, patched_manifest, keep_classes, keep_prefixes, keep_libs, encrypt_assets, 
+                 (signing_keystore, signing_ks_pass, signing_alias), key_bytes, resources_arsc)
+
+        if no_sign:
+            print("Skipping signing (--no-sign). Output APK may fail to install.")
+        else:
+            sign_apk(output, signing_keystore, signing_ks_pass, signing_alias)
 
     print(f"Done! Protected APK: {output}")
 

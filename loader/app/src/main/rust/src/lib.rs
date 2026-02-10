@@ -1,5 +1,5 @@
 use jni::JNIEnv;
-use jni::objects::{JClass, JObject, JString, JValue, JObjectArray};
+use jni::objects::{JClass, JObject, JString, JValue, JObjectArray, JByteArray};
 use jni::sys::{jint, JNI_VERSION_1_6};
 use aes_gcm::{
     aead::{Aead, KeyInit},
@@ -14,7 +14,8 @@ mod config;
 mod strings_config;
 #[macro_use]
 mod obfuscate;
-use config::get_aes_key;
+use config::{get_aes_key, PAYLOAD_HASH, EXPECTED_SIGNATURE_HASH};
+use sha2::{Sha256, Digest};
 
 #[macro_use]
 extern crate log;
@@ -110,6 +111,12 @@ pub extern "system" fn Java_com_kapp_shell_ShellApplication_nativeLoadDex(
     let data_path_j = env.call_method(&data_dir_obj, "getAbsolutePath", "()Ljava/lang/String;", &[]).unwrap().l().unwrap();
     let data_path_str: String = env.get_string(&data_path_j.into()).unwrap().into();
 
+    if let Err(e) = verify_integrity(&mut env, &context, &apk_path) {
+        error!("Integrity check failed: {:?}", e);
+        // In a real hardened app, we should probably exit here.
+        // std::process::exit(1);
+    }
+
     if let Err(e) = load_dex_core(&mut env, &apk_path, &cache_path_str, &data_path_str, &class_loader, sdk_int) {
         error!("nativeLoadDex (Application) failed: {:?}", e);
         let _ = env.exception_clear();
@@ -135,7 +142,15 @@ pub extern "system" fn Java_com_kapp_shell_ShellApplication_nativeLoadDexWithApp
     let cache_path_str = format!("{}/cache", data_dir);
     std::fs::create_dir_all(&cache_path_str).unwrap_or(());
 
-    // 2. Load DEX using the modular core
+    // 2. Verify Integrity (Skip for now if we only have app_info, or pass JObject::null())
+    // For now, we skip signature check here to avoid complexity of getting PM from app_info.
+    // It will be verified in nativeLoadDex or BootstrapProvider anyway.
+    if let Err(e) = extract_payload(&apk_path, true) {
+        error!("Payload integrity failed: {:?}", e);
+        // std::process::exit(1);
+    }
+
+    // 3. Load DEX using the modular core
     if let Err(e) = load_dex_core(&mut env, &apk_path, &cache_path_str, &data_dir, &class_loader, sdk_int) {
         error!("nativeLoadDexWithAppInfo failed: {:?}", e);
         let _ = env.exception_clear();
@@ -170,6 +185,11 @@ pub extern "system" fn Java_com_kapp_shell_BootstrapProvider_nativeLoadDex(
     let data_path_j = env.call_method(&data_dir_obj, "getAbsolutePath", "()Ljava/lang/String;", &[]).unwrap().l().unwrap();
     let data_path_str: String = env.get_string(&data_path_j.into()).unwrap().into();
 
+    if let Err(e) = verify_integrity(&mut env, &context, &apk_path) {
+        error!("Integrity check failed: {:?}", e);
+        // std::process::exit(1);
+    }
+
     if let Err(e) = load_dex_core(&mut env, &apk_path, &cache_path_str, &data_path_str, &class_loader, sdk_int) {
         error!("nativeLoadDex (Provider) failed: {:?}", e);
         let _ = env.exception_clear();
@@ -184,7 +204,7 @@ fn load_dex_core(
     class_loader: &JObject,
     sdk_int: jint,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let payload = extract_payload(apk_path)?;
+    let payload = extract_payload(apk_path, true)?;
     
     // 1. Extract Assets
     extract_assets_core(data_path, &payload)?;
@@ -242,27 +262,97 @@ fn get_package_code_path(env: &mut JNIEnv, context: &JObject) -> Result<String, 
     Ok(path_str)
 }
 
-fn extract_payload(path: &str) -> Result<Vec<(String, Vec<u8>)>, Box<dyn std::error::Error>> {
+fn verify_integrity(
+    env: &mut JNIEnv,
+    context: &JObject,
+    apk_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Verify APK Signature
+    info!("Verifying APK signature...");
+    let package_name = env.call_method(context, "getPackageName", "()Ljava/lang/String;", &[])?.l()?;
+    let pm = env.call_method(context, "getPackageManager", "()Landroid/content/pm/PackageManager;", &[])?.l()?;
+    
+    // GET_SIGNATURES = 64
+    let package_info = env.call_method(&pm, "getPackageInfo", "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;", &[
+        (&package_name).into(),
+        64i32.into(),
+    ])?.l()?;
+    
+    let signatures_array: JObjectArray = env.get_field(&package_info, "signatures", "[Landroid/content/pm/Signature;")?.l()?.into();
+    if env.get_array_length(&signatures_array)? > 0 {
+        let signature = env.get_object_array_element(&signatures_array, 0)?;
+        let cert_bytes_j = env.call_method(&signature, "toByteArray", "()[B", &[])?.l()?;
+        let cert_bytes: Vec<u8> = env.convert_byte_array(&JByteArray::from(cert_bytes_j))?;
+        
+        let mut hasher = Sha256::new();
+        hasher.update(&cert_bytes);
+        let hash = hasher.finalize();
+        
+        if hash.as_slice() != EXPECTED_SIGNATURE_HASH {
+            error!("Signature mismatch! Expected: {}, Actual: {}", 
+                hex::encode(EXPECTED_SIGNATURE_HASH), 
+                hex::encode(hash));
+            return Err("Signature integrity check failed".into());
+        }
+        info!("Signature integrity verified.");
+    } else {
+        warn!("No signatures found in PackageInfo.");
+    }
+
+    // 2. Verify Payload Hash
+    info!("Verifying payload hash...");
+    // We already do this inside extract_payload if we pass verify=true
+    let _ = extract_payload(apk_path, true)?;
+    info!("Payload integrity verified.");
+
+    Ok(())
+}
+
+fn extract_payload(path: &str, verify: bool) -> Result<Vec<(String, Vec<u8>)>, Box<dyn std::error::Error>> {
     debug!("{} {}", s!(strings_config::MSG_OPEN_APK).replace("{}", ""), path);
     let apk_file = File::open(path)?;
     let mut apk_zip = ZipArchive::new(apk_file)?;
     debug!("Opening content...");
     let mut payload_entry = apk_zip.by_name(&s!(strings_config::PAYLOAD_NAME))?;
-    let mut payload_bytes = Vec::new();
-    payload_entry.read_to_end(&mut payload_bytes)?;
-    debug!("Read {} bytes from payload", payload_bytes.len());
+    let mut encrypted_data = Vec::new();
+    payload_entry.read_to_end(&mut encrypted_data)?;
+    debug!("Read {} bytes from payload", encrypted_data.len());
 
-    let mut file = std::io::Cursor::new(payload_bytes);
-    let file_len = file.get_ref().len() as u64;
+    if verify {
+        let mut hasher = Sha256::new();
+        hasher.update(&encrypted_data);
+        let hash = hasher.finalize();
+        if hash.as_slice() != PAYLOAD_HASH {
+            // Check if it's all zeros (empty/dummy config)
+            if PAYLOAD_HASH != [0u8; 32] {
+                error!("Payload hash mismatch! Expected: {}, Actual: {}", 
+                    hex::encode(PAYLOAD_HASH), 
+                    hex::encode(hash));
+                return Err("Payload integrity check failed".into());
+            } else {
+                warn!("Payload hash check skipped (embedded hash is zero).");
+            }
+        }
+    }
+
+    decrypt_payload(&encrypted_data, &get_aes_key())
+}
+
+fn decrypt_payload(
+    encrypted_data: &[u8],
+    key: &[u8; 32],
+) -> Result<Vec<(String, Vec<u8>)>, Box<dyn std::error::Error>> {
+    let mut file = std::io::Cursor::new(encrypted_data);
+    let file_len = encrypted_data.len() as u64;
 
     // Footer: [Metadata Size (4)] [Magic "SHELL" (5)]
     let footer_len = 9;
     if file_len < footer_len {
-        return Err("File too small".into());
+        return Err("Payload too small".into());
     }
 
     file.seek(SeekFrom::End(-(footer_len as i64)))?;
-    let mut footer = vec![0u8; footer_len as usize];
+    let mut footer = [0u8; 9];
     file.read_exact(&mut footer)?;
 
     let magic = &footer[4..9];
@@ -271,7 +361,6 @@ fn extract_payload(path: &str) -> Result<Vec<(String, Vec<u8>)>, Box<dyn std::er
     }
 
     let metadata_size = u32::from_le_bytes(footer[0..4].try_into()?) as u64;
-    debug!("Metadata size: {}", metadata_size);
     
     // Metadata Block: [N (4)] + [ [NameLen(2)] [Name] [Size(4)] [IV(12)] ] * N
     let metadata_start = file_len
@@ -287,7 +376,6 @@ fn extract_payload(path: &str) -> Result<Vec<(String, Vec<u8>)>, Box<dyn std::er
     let mut n_bytes = [0u8; 4];
     cursor.read_exact(&mut n_bytes)?;
     let num_files = u32::from_le_bytes(n_bytes);
-    debug!("Number of files in payload: {}", num_files);
 
     let mut entries = Vec::new();
     let mut total_encrypted_size = 0;
@@ -315,26 +403,23 @@ fn extract_payload(path: &str) -> Result<Vec<(String, Vec<u8>)>, Box<dyn std::er
     // Read Payloads
     let payload_start = metadata_start
         .checked_sub(total_encrypted_size)
-        .ok_or("Invalid payload size")?;
+        .ok_or("Invalid payload offset")?;
 
     file.seek(SeekFrom::Start(payload_start))?;
     
-    let key = get_aes_key();
-    let cipher = Aes256Gcm::new(&key.into());
+    let cipher = Aes256Gcm::new(key.into());
     let mut results = Vec::new();
 
     for (name, size, iv) in entries {
-        let mut encrypted_data = vec![0u8; size as usize];
-        file.read_exact(&mut encrypted_data)?;
+        let mut enc_buf = vec![0u8; size as usize];
+        file.read_exact(&mut enc_buf)?;
         
         let nonce = Nonce::from_slice(&iv);
-        let plaintext = cipher.decrypt(nonce, encrypted_data.as_ref())
-            .map_err(|e| format!("Decryption failed: {:?}", e))?;
+        let plaintext = cipher.decrypt(nonce, enc_buf.as_ref())
+            .map_err(|e| format!("Decryption failed for {}: {:?}", name, e))?;
         
-        debug!("Decrypted entry: {}", name);
         results.push((name, plaintext));
     }
-    debug!("Successfully decrypted {} entries", results.len());
     
     Ok(results)
 }

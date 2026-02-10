@@ -45,6 +45,12 @@ struct Args {
 
     #[arg(long)]
     resources: Option<PathBuf>,
+
+    #[arg(long)]
+    payload_out: Option<PathBuf>,
+
+    #[arg(long)]
+    payload_in: Option<PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -77,22 +83,35 @@ fn main() -> anyhow::Result<()> {
     println!("Keep prefixes: {:?}", keep_prefixes);
     println!("Keep libs: {:?}", keep_libs);
 
-    let payload_entries = collect_and_encrypt_payload_entries(
-        &args.target, 
-        &keep_descriptors, 
-        &keep_prefixes, 
-        &keep_libs,
-        &args.encrypt_asset
-    )?;
-    let encrypted_entry_names: HashSet<String> = payload_entries
-        .iter()
-        .map(|(name, _, _)| name.clone())
-        .collect();
-    if payload_entries.is_empty() {
-        anyhow::bail!("No classes*.dex or lib/**/*.so found in target APK");
+    let payload_blob = if let Some(path) = &args.payload_in {
+        println!("Using pre-generated payload from {}", path.display());
+        let mut f = File::open(path)?;
+        let mut b = Vec::new();
+        f.read_to_end(&mut b)?;
+        b
+    } else {
+        let entries = collect_and_encrypt_payload_entries(
+            &args.target, 
+            &keep_descriptors, 
+            &keep_prefixes, 
+            &keep_libs,
+            &args.encrypt_asset
+        )?;
+        if entries.is_empty() {
+            anyhow::bail!("No classes*.dex or lib/**/*.so found in target APK");
+        }
+        build_payload_blob(&entries)
+    };
+
+    if let Some(path) = &args.payload_out {
+        println!("Saving payload blob to {}", path.display());
+        let mut f = File::create(path)?;
+        f.write_all(&payload_blob)?;
+        return Ok(());
     }
 
-    let payload_blob = build_payload_blob(&payload_entries);
+    let encrypted_entry_names = get_encrypted_names_from_blob(&payload_blob);
+
     repack_target_with_bootstrap(
         &args.target,
         &args.bootstrap_apk,
@@ -280,6 +299,40 @@ fn build_payload_blob(entries: &[(String, Vec<u8>, [u8; 12])]) -> Vec<u8> {
     payload_blob.extend_from_slice(b"SHELL");
 
     payload_blob
+}
+
+fn get_encrypted_names_from_blob(blob: &[u8]) -> HashSet<String> {
+    let mut names = HashSet::new();
+    if blob.len() < 9 || !blob.ends_with(b"SHELL") {
+        return names;
+    }
+
+    let metadata_len = u32::from_le_bytes(blob[blob.len()-9..blob.len()-5].try_into().unwrap()) as usize;
+    if blob.len() < 9 + metadata_len {
+        return names;
+    }
+
+    let metadata = &blob[blob.len()-9-metadata_len..blob.len()-9];
+    let mut pos = 0;
+    
+    if metadata.len() < 4 { return names; }
+    let count = u32::from_le_bytes(metadata[0..4].try_into().unwrap()) as usize;
+    pos += 4;
+
+    for _ in 0..count {
+        if pos + 2 > metadata.len() { break; }
+        let name_len = u16::from_le_bytes(metadata[pos..pos+2].try_into().unwrap()) as usize;
+        pos += 2;
+        if pos + name_len > metadata.len() { break; }
+        let name = String::from_utf8_lossy(&metadata[pos..pos+name_len]).to_string();
+        names.insert(name);
+        pos += name_len;
+        
+        if pos + 4 + 12 > metadata.len() { break; }
+        pos += 4 + 12; // skip data_len and nonce
+    }
+
+    names
 }
 
 fn repack_target_with_bootstrap(
