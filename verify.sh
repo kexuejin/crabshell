@@ -40,6 +40,30 @@ if ! command -v cargo-ndk &> /dev/null; then
     exit 1
 fi
 
+# 3.1 Check apktool
+if ! command -v apktool &> /dev/null; then
+    echo -e "${RED}[WARN] apktool is not installed.${NC}"
+    echo "pack.py can auto-download apktool jar fallback if java is available."
+else
+    echo -e "${GREEN}[OK] apktool is installed.${NC}"
+fi
+
+# 3.2 Check apksigner
+if ! command -v apksigner &> /dev/null; then
+    echo -e "${RED}[WARN] apksigner is not in PATH.${NC}"
+    echo "pack.py will try Android SDK build-tools auto-discovery."
+else
+    echo -e "${GREEN}[OK] apksigner is installed.${NC}"
+fi
+
+# 3.3 Check zipalign (recommended)
+if ! command -v zipalign &> /dev/null; then
+    echo -e "${RED}[WARN] zipalign is not installed.${NC}"
+    echo "Install Android build-tools for better APK alignment compatibility."
+else
+    echo -e "${GREEN}[OK] zipalign is installed.${NC}"
+fi
+
 # 4. Check Gradle (or Wrapper)
 if [ ! -f "loader/gradlew" ]; then
     echo -e "${RED}[WARN] Gradle Wrapper not found.${NC}"
@@ -113,7 +137,7 @@ if [ -z "$ANDROID_NDK_HOME" ]; then
     exit 1
 fi
 
-cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -o ../jniLibs build --release
+cargo ndk -t arm64-v8a -t armeabi-v7a -o ../jniLibs build --release
 if [ $? -ne 0 ]; then
     echo -e "${RED}[FAIL] Cargo NDK build failed.${NC}"
     exit 1

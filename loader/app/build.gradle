@@ -36,8 +36,6 @@ android {
 }
 
 dependencies {
-    implementation 'androidx.appcompat:appcompat:1.6.1'
-    implementation 'com.google.android.material:material:1.11.0'
     testImplementation 'junit:junit:4.13.2'
     androidTestImplementation 'androidx.test.ext:junit:1.1.5'
     androidTestImplementation 'androidx.test.espresso:espresso-core:3.5.1'
@@ -49,14 +47,43 @@ tasks.register('cargoBuild', Exec) {
     // Here we assume a single target for demonstration or iterate all.
     // You would typically use cargo-ndk here.
     environment 'PATH', "${System.env.PATH}:${System.env.HOME}/.cargo/bin"
-    environment 'ANDROID_NDK_HOME', "${System.env.HOME}/Library/Android/sdk/ndk/26.0.10792818"
-    commandLine 'cargo', 'ndk', '-t', 'arm64-v8a', '-t', 'armeabi-v7a', '-t', 'x86_64', '-o', 'src/main/jniLibs', 'build', '--release'
+    // Prefer ANDROID_NDK_HOME, otherwise auto-detect from common SDK locations.
+    def ndkHome = System.env.ANDROID_NDK_HOME
+    if (!ndkHome) {
+        def ndkCandidates = [
+            System.env.ANDROID_SDK_ROOT ? new File(System.env.ANDROID_SDK_ROOT, 'ndk') : null,
+            System.env.ANDROID_HOME ? new File(System.env.ANDROID_HOME, 'ndk') : null,
+            new File("${System.env.HOME}/Library/Android/sdk/ndk"),
+            new File("${System.env.HOME}/Library/Android/sdk/ndk-bundle")
+        ].findAll { it != null && it.exists() }
+
+        for (def candidate : ndkCandidates) {
+            if (candidate.name == 'ndk-bundle' && new File(candidate, 'toolchains').exists()) {
+                ndkHome = candidate.absolutePath
+                break
+            }
+
+            if (candidate.name == 'ndk') {
+                def versions = candidate.listFiles()?.findAll { it.isDirectory() }?.sort { a, b -> a.name <=> b.name }
+                if (versions && !versions.isEmpty()) {
+                    ndkHome = versions.last().absolutePath
+                    break
+                }
+            }
+        }
+    }
+
+    if (!ndkHome || !file(ndkHome).exists()) {
+        throw new GradleException('Android NDK not found. Set ANDROID_NDK_HOME or install NDK via Android Studio SDK Manager.')
+    }
+
+    environment 'ANDROID_NDK_HOME', ndkHome
+    commandLine 'cargo', 'ndk', '-t', 'arm64-v8a', '-t', 'armeabi-v7a', '-o', '../jniLibs', 'build', '--release'
     workingDir 'src/main/rust'
     
-    // Fail gracefully if cargo is not found (packer tool logic handles this communication)
-    ignoreExitValue = true
+    // Keep Android build honest: Rust/NDK failure should fail the build.
+    ignoreExitValue = false
 }
 
 // Hook cargo build into the build process
-// preBuild.dependsOn cargoBuild 
-// Commented out to prevent build failure during scaffold if Rust is missing
+preBuild.dependsOn cargoBuild

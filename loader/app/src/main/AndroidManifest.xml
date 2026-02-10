@@ -16,6 +16,12 @@
         
         <!-- The original application's metadata will be merged here -->
         
+        <!-- Disable default WorkManager initializer to use on-demand initialization (Configuration.Provider) -->
+        <!-- This also prevents androidx.startup from crashing due to missing resources -->
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            tools:node="remove" />
     </application>
 
 </manifest>

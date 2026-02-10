@@ -23,17 +23,17 @@ CrabShell involves a custom Android Packer solution designed to protect Android 
 
 The project consists of two main components:
 
-1.  **Packer (Host-side)**: A Rust CLI tool.
-    -   Reads the target APK.
-    -   Extracts `classes*.dex` and `lib/**/*.so`.
-    -   Encrypts them individually.
-    -   Appends the encrypted payload + metadata to the `Shell` APK.
+1.  **Packer (Host-side)**: Rust + Python pipeline.
+    -   Uses the **target APK as final base** (resources/manifest preserved).
+    -   Encrypts target `classes*.dex` and `lib/**/*.so` into `assets/kapp_payload.bin`.
+    -   Injects bootstrap loader dex + `libshell.so`.
+    -   Re-signs the output APK.
 
 2.  **Shell (Android-side)**: A stub Android application.
     -   Usage standard Android entry points (`Application.attachBaseContext`).
     -   Loads a native Rust library (`libshell.so`).
-    -   Locates the appended payload in its own APK.
-    -   Decrypts and loads the original app's code and resources.
+    -   Locates encrypted payload from `assets/kapp_payload.bin`.
+    -   Decrypts and loads the original app's code in runtime.
 
 ## Prerequisites
 
@@ -44,6 +44,8 @@ The project consists of two main components:
     -   Add targets: `rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android`
 -   **Python 3**: For the automation script.
 -   **JDK 17+**: For Android Gradle build.
+-   **apktool**: Required for target manifest patch/rebuild.
+-   **Android build-tools**: `apksigner` (required), `zipalign` (recommended).
 
 ## Quick Start
 
@@ -57,7 +59,8 @@ Instead of passing arguments every time, you can create a `kapp-config.json` fil
     "output": "protected.apk",
     "keystore": "release.jks",
     "ks_pass": "password",
-    "key_alias": "alias"
+    "key_alias": "alias",
+    "no_sign": false
 }
 ```
 
@@ -103,6 +106,15 @@ python3 pack.py
         --ks-pass pass:secret \
         --key-alias my-alias
     ```
+
+    If no signing options are provided, the script now auto-signs with Android debug keystore
+    (`~/.android/debug.keystore`). If missing, it will be generated automatically.
+
+4.  **Skip Signing** (Optional):
+    ```bash
+    python3 pack.py --target app.apk --output protected.apk --no-sign
+    ```
+    *Note: Unsigned APKs usually cannot be installed directly on devices.*
 
 ## Manual Build
 
