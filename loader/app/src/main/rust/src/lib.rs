@@ -75,7 +75,12 @@ pub extern "system" fn Java_com_kapp_shell_ShellApplication_nativeLoadDex(
 
     let class_loader = env.call_method(&context, "getClassLoader", "()Ljava/lang/ClassLoader;", &[]).unwrap().l().unwrap();
 
-    if let Err(e) = load_dex_core(&mut env, &apk_path, &cache_path_str, &class_loader, sdk_int) {
+    let files_dir = env.call_method(&context, "getFilesDir", "()Ljava/io/File;", &[]).unwrap().l().unwrap();
+    let data_dir_obj = env.call_method(&files_dir, "getParentFile", "()Ljava/io/File;", &[]).unwrap().l().unwrap();
+    let data_path_j = env.call_method(&data_dir_obj, "getAbsolutePath", "()Ljava/lang/String;", &[]).unwrap().l().unwrap();
+    let data_path_str: String = env.get_string(&data_path_j.into()).unwrap().into();
+
+    if let Err(e) = load_dex_core(&mut env, &apk_path, &cache_path_str, &data_path_str, &class_loader, sdk_int) {
         error!("nativeLoadDex (Application) failed: {:?}", e);
         let _ = env.exception_clear();
     }
@@ -101,7 +106,7 @@ pub extern "system" fn Java_com_kapp_shell_ShellApplication_nativeLoadDexWithApp
     std::fs::create_dir_all(&cache_path_str).unwrap_or(());
 
     // 2. Load DEX using the modular core
-    if let Err(e) = load_dex_core(&mut env, &apk_path, &cache_path_str, &class_loader, sdk_int) {
+    if let Err(e) = load_dex_core(&mut env, &apk_path, &cache_path_str, &data_dir, &class_loader, sdk_int) {
         error!("nativeLoadDexWithAppInfo failed: {:?}", e);
         let _ = env.exception_clear();
     }
@@ -130,7 +135,12 @@ pub extern "system" fn Java_com_kapp_shell_BootstrapProvider_nativeLoadDex(
 
     let class_loader = env.call_method(&context, "getClassLoader", "()Ljava/lang/ClassLoader;", &[]).unwrap().l().unwrap();
 
-    if let Err(e) = load_dex_core(&mut env, &apk_path, &cache_path_str, &class_loader, sdk_int) {
+    let files_dir = env.call_method(&context, "getFilesDir", "()Ljava/io/File;", &[]).unwrap().l().unwrap();
+    let data_dir_obj = env.call_method(&files_dir, "getParentFile", "()Ljava/io/File;", &[]).unwrap().l().unwrap();
+    let data_path_j = env.call_method(&data_dir_obj, "getAbsolutePath", "()Ljava/lang/String;", &[]).unwrap().l().unwrap();
+    let data_path_str: String = env.get_string(&data_path_j.into()).unwrap().into();
+
+    if let Err(e) = load_dex_core(&mut env, &apk_path, &cache_path_str, &data_path_str, &class_loader, sdk_int) {
         error!("nativeLoadDex (Provider) failed: {:?}", e);
         let _ = env.exception_clear();
     }
@@ -140,16 +150,56 @@ fn load_dex_core(
     env: &mut JNIEnv,
     apk_path: &str,
     cache_path: &str,
+    data_path: &str,
     class_loader: &JObject,
     sdk_int: jint,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let decrypted_dex = extract_payload(apk_path)?;
+    let payload = extract_payload(apk_path)?;
     
+    // 1. Extract Assets
+    extract_assets_core(data_path, &payload)?;
+
+    // 2. Load DEX and Libs
     if sdk_int >= 26 {
-        load_in_memory(env, cache_path, class_loader, &decrypted_dex)
+        load_in_memory(env, cache_path, class_loader, &payload)
     } else {
-        load_file_landing(env, cache_path, class_loader, &decrypted_dex)
+        load_file_landing(env, cache_path, class_loader, &payload)
     }.map_err(|e| e.into())
+}
+
+fn extract_assets_core(
+    data_path: &str,
+    payload: &[(String, Vec<u8>)],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let zip_path = format!("{}/files/kapp_assets.zip", data_path);
+    debug!("extract_assets_core: Landing assets in {}", zip_path);
+    
+    // Ensure parent directory (files) exists
+    if let Some(parent) = std::path::Path::new(&zip_path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let file = File::create(&zip_path)?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::FileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored); // Store uncompressed for speed/simplicity
+
+    let mut asset_count = 0;
+    for (name, data) in payload {
+        if name.starts_with("assets/") {
+            debug!("Adding asset to ZIP: {}", name);
+            zip.start_file(name, options)?;
+            zip.write_all(data)?;
+            asset_count += 1;
+        }
+    }
+    
+    zip.finish()?;
+
+    if asset_count > 0 {
+        info!("Successfully packed {} protected assets into {}", asset_count, zip_path);
+    }
+    Ok(())
 }
 
 fn get_package_code_path(env: &mut JNIEnv, context: &JObject) -> Result<String, jni::errors::Error> {

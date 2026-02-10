@@ -114,7 +114,11 @@ def ensure_apktool_cmd() -> list[str]:
 
 def build_packer():
     print("Building Packer...")
-    subprocess.check_call(["cargo", "build", "--release"], cwd=PACKER_DIR)
+    env = os.environ.copy()
+    cargo_bin = os.path.expanduser("~/.cargo/bin")
+    if cargo_bin not in env.get("PATH", ""):
+        env["PATH"] = f"{cargo_bin}:{env.get('PATH', '')}"
+    subprocess.check_call(["cargo", "build", "--release"], cwd=PACKER_DIR, env=env)
 
 
 def patch_shell_loader_constants(original_app: str, original_factory: str):
@@ -139,6 +143,10 @@ def patch_shell_loader_constants(original_app: str, original_factory: str):
 def build_shell():
     print("Building Shell (Native)...")
     env = os.environ.copy()
+    
+    cargo_bin = os.path.expanduser("~/.cargo/bin")
+    if cargo_bin not in env.get("PATH", ""):
+        env["PATH"] = f"{cargo_bin}:{env.get('PATH', '')}"
 
     if "ANDROID_NDK_HOME" in env:
         ndk_home = env["ANDROID_NDK_HOME"]
@@ -412,6 +420,7 @@ def pack_apk(
     keep_classes: list[str],
     keep_prefixes: list[str],
     keep_libs: list[str],
+    encrypt_assets: list[str],
     resources_arsc: Optional[str] = None,
 ):
     packer_bin = os.path.join(PACKER_DIR, "target", "release", "packer")
@@ -446,6 +455,9 @@ def pack_apk(
 
     for keep_lib in keep_libs:
         cmd.extend(["--keep-lib", keep_lib])
+
+    for asset_pattern in encrypt_assets:
+        cmd.extend(["--encrypt-asset", asset_pattern])
 
     subprocess.check_call(cmd)
 
@@ -540,6 +552,7 @@ def main():
     parser.add_argument("--keep-class", action="append", help="Class names to keep in plaintext (can be specified multiple times)")
     parser.add_argument("--keep-prefix", action="append", help="Package prefixes to keep in plaintext (can be specified multiple times)")
     parser.add_argument("--keep-lib", action="append", help="Library names (without lib prefix or .so) to keep in plaintext (can be specified multiple times)")
+    parser.add_argument("--encrypt-asset", action="append", help="Pattern of assets to encrypt (e.g. assets/*.js)")
 
     args = parser.parse_args()
 
@@ -614,8 +627,12 @@ def main():
             
         if keep_libs:
             print(f"Keeping early startup libraries in plaintext: {keep_libs}")
-            
-        pack_apk(target, output, bootstrap_apk, patched_manifest, keep_classes, keep_prefixes, keep_libs, resources_arsc)
+
+        encrypt_assets = args.encrypt_asset or config.get("encrypt_asset", [])
+        if isinstance(encrypt_assets, str):
+            encrypt_assets = [encrypt_assets]
+
+        pack_apk(target, output, bootstrap_apk, patched_manifest, keep_classes, keep_prefixes, keep_libs, encrypt_assets, resources_arsc)
 
     if no_sign:
         print("Skipping signing (--no-sign). Output APK may fail to install.")

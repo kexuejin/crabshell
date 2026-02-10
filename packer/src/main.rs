@@ -40,6 +40,9 @@ struct Args {
     #[arg(long = "keep-lib")]
     keep_lib: Vec<String>,
 
+    #[arg(long = "encrypt-asset")]
+    encrypt_asset: Vec<String>,
+
     #[arg(long)]
     resources: Option<PathBuf>,
 }
@@ -74,7 +77,13 @@ fn main() -> anyhow::Result<()> {
     println!("Keep prefixes: {:?}", keep_prefixes);
     println!("Keep libs: {:?}", keep_libs);
 
-    let payload_entries = collect_and_encrypt_payload_entries(&args.target, &keep_descriptors, &keep_prefixes, &keep_libs)?;
+    let payload_entries = collect_and_encrypt_payload_entries(
+        &args.target, 
+        &keep_descriptors, 
+        &keep_prefixes, 
+        &keep_libs,
+        &args.encrypt_asset
+    )?;
     let encrypted_entry_names: HashSet<String> = payload_entries
         .iter()
         .map(|(name, _, _)| name.clone())
@@ -102,7 +111,8 @@ fn main() -> anyhow::Result<()> {
 fn is_payload_entry(name: &str) -> bool {
     let is_dex = name.starts_with("classes") && name.ends_with(".dex");
     let is_lib = name.starts_with("lib/") && name.ends_with(".so");
-    is_dex || is_lib
+    let is_asset = name.starts_with("assets/");
+    is_dex || is_lib || is_asset
 }
 
 fn to_dex_descriptor(class_name: &str) -> String {
@@ -167,11 +177,40 @@ fn should_keep_lib(name: &str, keep_libs: &[String]) -> bool {
     false
 }
 
+fn should_encrypt_asset(name: &str, encrypt_asset_patterns: &[String]) -> bool {
+    if !name.starts_with("assets/") {
+        return false;
+    }
+    // Don't encrypt our own shell payload or manifest
+    if name == "assets/kapp_payload.bin" {
+        return false;
+    }
+    
+    for pattern in encrypt_asset_patterns {
+        if pattern == "*" || pattern == "assets/*" {
+             return true;
+        }
+        if pattern.starts_with('*') {
+            if name.ends_with(&pattern[1..]) {
+                return true;
+            }
+        } else if pattern.ends_with('*') {
+            if name.starts_with(&pattern[0..pattern.len()-1]) {
+                return true;
+            }
+        } else if name == pattern || format!("assets/{}", pattern) == name {
+            return true;
+        }
+    }
+    false
+}
+
 fn collect_and_encrypt_payload_entries(
     target_apk: &Path,
     keep_descriptors: &[String],
     keep_prefixes: &[String],
     keep_libs: &[String],
+    encrypt_asset_patterns: &[String],
 ) -> anyhow::Result<Vec<(String, Vec<u8>, [u8; 12])>> {
     let target_file = File::open(target_apk)?;
     let mut zip = ZipArchive::new(target_file)?;
@@ -199,6 +238,13 @@ fn collect_and_encrypt_payload_entries(
             if name.ends_with(".so") && should_keep_lib(&name, keep_libs) {
                 println!("Keeping {} in plaintext for startup compatibility", name);
                 continue;
+            }
+
+            if name.starts_with("assets/") {
+                if !should_encrypt_asset(&name, encrypt_asset_patterns) {
+                    // It's an asset but not marked for encryption
+                    continue;
+                }
             }
 
             println!("Encrypting {}...", name);

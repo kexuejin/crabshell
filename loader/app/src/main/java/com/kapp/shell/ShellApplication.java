@@ -81,6 +81,9 @@ public class ShellApplication extends Application {
             // Replace ShellApplication with originalApp in the system
             replaceApplication(getBaseContext(), originalApp);
 
+            // Inject extracted assets
+            injectAssets(getApplicationContext());
+
             // Initialize WorkManager via reflection if originalApp provides configuration
             initializeWorkManager(originalApp);
 
@@ -90,6 +93,30 @@ public class ShellApplication extends Application {
         } catch (Exception e) {
             Log.e(TAG, "onCreate: Failed to delegate to original application", e);
             throw new RuntimeException(e);
+        }
+    }
+
+    private void injectAssets(Context context) {
+        try {
+            File assetsZip = new File(context.getFilesDir(), "kapp_assets.zip");
+            if (!assetsZip.exists()) {
+                Log.w(TAG, "injectAssets: kapp_assets.zip does not exist, skipping");
+                return;
+            }
+
+            android.content.res.AssetManager am = context.getAssets();
+            java.lang.reflect.Method addAssetPath = android.content.res.AssetManager.class
+                    .getDeclaredMethod("addAssetPath", String.class);
+            addAssetPath.setAccessible(true);
+
+            String path = assetsZip.getAbsolutePath();
+            Log.d(TAG, "injectAssets: Adding asset path: " + path);
+
+            Object cookie = addAssetPath.invoke(am, path);
+            Log.d(TAG, "injectAssets: Result cookie: " + cookie);
+
+        } catch (Exception e) {
+            Log.e(TAG, "injectAssets: Failed to inject assets", e);
         }
     }
 
