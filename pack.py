@@ -216,6 +216,9 @@ def build_shell():
     gradlew = "./gradlew" if os.path.exists(os.path.join(SHELL_PROJECT_DIR, "gradlew")) else "gradle"
     subprocess.check_call([gradlew, "assembleRelease"], cwd=SHELL_PROJECT_DIR, env=env)
 
+    print("Building Packer...")
+    subprocess.check_call(["cargo", "build", "--release"], cwd=PACKER_DIR, env=env)
+
 
 def get_shell_apk_path() -> str:
     shell_apk = os.path.join(
@@ -321,6 +324,11 @@ def decode_and_patch_target_manifest(target_apk: str, temp_dir: str) -> Tuple[st
     
     # Replace the application class with our shell
     application.set(ANDROID_NAME, "com.kapp.shell.ShellApplication")
+    
+    # Strip debuggable flag to ensure ptrace works and app is hardened
+    if f"{{{ANDROID_NS}}}debuggable" in application.attrib:
+        print("Stripping android:debuggable attribute...")
+        del application.attrib[f"{{{ANDROID_NS}}}debuggable"]
 
     # Inject original app metadata
     original_app_meta = None

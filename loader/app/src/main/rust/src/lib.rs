@@ -24,32 +24,52 @@ pub extern "system" fn JNI_OnLoad(_vm: jni::JavaVM, _reserved: *mut c_void) -> j
             .with_tag("KAppShell")
             .with_max_level(log::LevelFilter::Debug),
     );
+    // Sleep to allow logcat to catch up
+    std::thread::sleep(std::time::Duration::from_millis(500));
     info!("Native library loaded, JNI_OnLoad called");
 
-    // Basic Anti-Debug: Check TracerPid
-    if is_debugger_attached() {
-        warn!("Debugger detected! Exiting...");
-        std::process::exit(1);
-    }
+    // Anti-Debug: Check TracerPid and Ptrace
+    check_debugger();
+
     JNI_VERSION_1_6
 }
 
-fn is_debugger_attached() -> bool {
-    // Check /proc/self/status for TracerPid
+fn check_debugger() {
+    // 1. Check TracerPid
     if let Ok(content) = std::fs::read_to_string("/proc/self/status") {
         for line in content.lines() {
             if line.starts_with("TracerPid:") {
-                if let Some(pid_str) = line.split_whitespace().nth(1) {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() > 1 {
+                    let pid_str = parts[1];
+                    info!("TracerPid: {}", pid_str);
                     if let Ok(pid) = pid_str.parse::<i32>() {
                         if pid > 0 {
-                            return true;
+                            error!("Debugger detected (TracerPid={})! Exiting...", pid);
+                            std::process::exit(1);
                         }
                     }
                 }
             }
         }
     }
-    false
+
+    // 2. Check Ptrace (PTRACE_TRACEME)
+    // If we can't trace ourselves, someone else is likely tracing us.
+    unsafe {
+        if libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) == -1 {
+             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+             if errno == 13 {
+                 // EACCES: likely SELinux restriction, not necessarily a debugger
+                 info!("Ptrace TRACEME restricted by system (errno 13).");
+             } else {
+                 error!("Debugger detected (ptrace failed with errno {})!", errno);
+                 // std::process::exit(1);
+             }
+        } else {
+            info!("Ptrace TRACEME successful (no debugger attached).");
+        }
+    }
 }
 
 #[no_mangle]
