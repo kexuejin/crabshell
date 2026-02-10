@@ -11,6 +11,9 @@ use std::io::{Read, Write, Seek, SeekFrom};
 use zip::ZipArchive;
 
 mod config;
+mod strings_config;
+#[macro_use]
+mod obfuscate;
 use config::get_aes_key;
 
 #[macro_use]
@@ -21,7 +24,7 @@ use android_logger::Config;
 pub extern "system" fn JNI_OnLoad(_vm: jni::JavaVM, _reserved: *mut c_void) -> jint {
     android_logger::init_once(
         Config::default()
-            .with_tag("KAppShell")
+            .with_tag(s!(strings_config::LOG_TAG))
             .with_max_level(log::LevelFilter::Debug),
     );
     // Sleep to allow logcat to catch up
@@ -36,16 +39,20 @@ pub extern "system" fn JNI_OnLoad(_vm: jni::JavaVM, _reserved: *mut c_void) -> j
 
 fn check_debugger() {
     // 1. Check TracerPid
-    if let Ok(content) = std::fs::read_to_string("/proc/self/status") {
+    if let Ok(content) = std::fs::read_to_string(&s!(strings_config::PROC_STATUS)) {
         for line in content.lines() {
-            if line.starts_with("TracerPid:") {
+            if line.starts_with(&s!(strings_config::TRACER_PID)) {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() > 1 {
                     let pid_str = parts[1];
-                    info!("TracerPid: {}", pid_str);
+                    info!("{} {}", s!(strings_config::TRACER_PID), pid_str);
                     if let Ok(pid) = pid_str.parse::<i32>() {
                         if pid > 0 {
-                            error!("Debugger detected (TracerPid={})! Exiting...", pid);
+                            error!("{} {}={}! {}", 
+                                s!(strings_config::DEBUG_DETECTED), 
+                                s!(strings_config::TRACER_PID), 
+                                pid, 
+                                s!(strings_config::EXITING));
                             std::process::exit(1);
                         }
                     }
@@ -61,13 +68,16 @@ fn check_debugger() {
              let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
              if errno == 13 {
                  // EACCES: likely SELinux restriction, not necessarily a debugger
-                 info!("Ptrace TRACEME restricted by system (errno 13).");
+                 info!("{}", s!(strings_config::PTRACE_RESTRICTED));
              } else {
-                 error!("Debugger detected (ptrace failed with errno {})!", errno);
+                 error!("{} ({})! {}", 
+                    s!(strings_config::DEBUG_DETECTED), 
+                    s!(strings_config::PTRACE_FAILED).replace("{}", &errno.to_string()),
+                    s!(strings_config::EXITING));
                  // std::process::exit(1);
              }
         } else {
-            info!("Ptrace TRACEME successful (no debugger attached).");
+            info!("{}", s!(strings_config::PTRACE_SUCCESS));
         }
     }
 }
@@ -75,11 +85,11 @@ fn check_debugger() {
 #[no_mangle]
 pub extern "system" fn Java_com_kapp_shell_ShellApplication_nativeLoadDex(
     mut env: JNIEnv,
-    _class: JClass,
+    _this: JObject,
     context: JObject,
     sdk_int: jint,
 ) {
-    info!("nativeLoadDex (Application) called for SDK {}", sdk_int);
+    info!("{} {}", s!(strings_config::MSG_NATIVE_LOAD_DEX).replace("{}", ""), sdk_int);
     let apk_path = match get_package_code_path(&mut env, &context) {
         Ok(path) => path,
         Err(e) => {
@@ -114,7 +124,7 @@ pub extern "system" fn Java_com_kapp_shell_ShellApplication_nativeLoadDexWithApp
     class_loader: JObject,
     sdk_int: jint,
 ) {
-    info!("nativeLoadDexWithAppInfo called for SDK {}", sdk_int);
+    info!("{} {}", s!(strings_config::MSG_NATIVE_LOAD_DEX).replace("{}", ""), sdk_int);
     
     // 1. Get APK path and data dir from ApplicationInfo
     let source_dir_j = env.get_field(&app_info, "sourceDir", "Ljava/lang/String;").unwrap().l().unwrap();
@@ -233,11 +243,11 @@ fn get_package_code_path(env: &mut JNIEnv, context: &JObject) -> Result<String, 
 }
 
 fn extract_payload(path: &str) -> Result<Vec<(String, Vec<u8>)>, Box<dyn std::error::Error>> {
-    debug!("Opening APK at {}", path);
+    debug!("{} {}", s!(strings_config::MSG_OPEN_APK).replace("{}", ""), path);
     let apk_file = File::open(path)?;
     let mut apk_zip = ZipArchive::new(apk_file)?;
-    debug!("Opening assets/kapp_payload.bin...");
-    let mut payload_entry = apk_zip.by_name("assets/kapp_payload.bin")?;
+    debug!("Opening content...");
+    let mut payload_entry = apk_zip.by_name(&s!(strings_config::PAYLOAD_NAME))?;
     let mut payload_bytes = Vec::new();
     payload_entry.read_to_end(&mut payload_bytes)?;
     debug!("Read {} bytes from payload", payload_bytes.len());
@@ -256,9 +266,8 @@ fn extract_payload(path: &str) -> Result<Vec<(String, Vec<u8>)>, Box<dyn std::er
     file.read_exact(&mut footer)?;
 
     let magic = &footer[4..9];
-    debug!("Payload magic: {:?}", std::str::from_utf8(magic));
-    if magic != b"SHELL" {
-        return Err("No shell payload found".into());
+    if magic != s!(strings_config::MAGIC_SHELL).as_bytes() {
+        return Err(s!(strings_config::ERR_NO_PAYLOAD).into());
     }
 
     let metadata_size = u32::from_le_bytes(footer[0..4].try_into()?) as u64;
