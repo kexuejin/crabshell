@@ -69,24 +69,40 @@ pub extern "system" fn Java_com_kapp_shell_ShellApplication_nativeLoadDex(
         }
     };
     
-    // 2. Extract and decrypt the payload
-    let decrypted_dex = match extract_payload(&apk_path) {
-        Ok(data) => data,
-        Err(e) => {
-            error!("Failed to extract payload: {:?}", e);
-            return;
-        }
-    };
+    let cache_dir = env.call_method(&context, "getCacheDir", "()Ljava/io/File;", &[]).unwrap().l().unwrap();
+    let cache_path = env.call_method(&cache_dir, "getAbsolutePath", "()Ljava/lang/String;", &[]).unwrap().l().unwrap();
+    let cache_path_str: String = env.get_string(&cache_path.into()).unwrap().into();
 
-    // 3. Load DEX
-    let res = if sdk_int >= 26 {
-        load_in_memory(&mut env, &context, &decrypted_dex)
-    } else {
-        load_file_landing(&mut env, &context, &decrypted_dex)
-    };
+    let class_loader = env.call_method(&context, "getClassLoader", "()Ljava/lang/ClassLoader;", &[]).unwrap().l().unwrap();
+
+    if let Err(e) = load_dex_core(&mut env, &apk_path, &cache_path_str, &class_loader, sdk_int) {
+        error!("nativeLoadDex (Application) failed: {:?}", e);
+        let _ = env.exception_clear();
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_kapp_shell_ShellApplication_nativeLoadDexWithAppInfo(
+    mut env: JNIEnv,
+    _class: JClass,
+    app_info: JObject,
+    class_loader: JObject,
+    sdk_int: jint,
+) {
+    info!("nativeLoadDexWithAppInfo called for SDK {}", sdk_int);
     
-    if let Err(e) = res {
-        error!("native_load_dex failed: {:?}", e);
+    // 1. Get APK path and data dir from ApplicationInfo
+    let source_dir_j = env.get_field(&app_info, "sourceDir", "Ljava/lang/String;").unwrap().l().unwrap();
+    let apk_path: String = env.get_string(&source_dir_j.into()).unwrap().into();
+    
+    let data_dir_j = env.get_field(&app_info, "dataDir", "Ljava/lang/String;").unwrap().l().unwrap();
+    let data_dir: String = env.get_string(&data_dir_j.into()).unwrap().into();
+    let cache_path_str = format!("{}/cache", data_dir);
+    std::fs::create_dir_all(&cache_path_str).unwrap_or(());
+
+    // 2. Load DEX using the modular core
+    if let Err(e) = load_dex_core(&mut env, &apk_path, &cache_path_str, &class_loader, sdk_int) {
+        error!("nativeLoadDexWithAppInfo failed: {:?}", e);
         let _ = env.exception_clear();
     }
 }
@@ -102,30 +118,38 @@ pub extern "system" fn Java_com_kapp_shell_BootstrapProvider_nativeLoadDex(
     let apk_path = match get_package_code_path(&mut env, &context) {
         Ok(path) => path,
         Err(e) => {
-             error!("Failed to get package code path (Provider): {:?}", e);
-             let _ = env.exception_clear();
-             return;
+            error!("Failed to get package code path (Provider): {:?}", e);
+            let _ = env.exception_clear();
+            return;
         }
     };
 
-    let decrypted_dex = match extract_payload(&apk_path) {
-        Ok(data) => data,
-        Err(e) => {
-             error!("Failed to extract payload (Provider): {:?}", e);
-             return;
-        }
-    };
+    let cache_dir = env.call_method(&context, "getCacheDir", "()Ljava/io/File;", &[]).unwrap().l().unwrap();
+    let cache_path = env.call_method(&cache_dir, "getAbsolutePath", "()Ljava/lang/String;", &[]).unwrap().l().unwrap();
+    let cache_path_str: String = env.get_string(&cache_path.into()).unwrap().into();
 
-    let res = if sdk_int >= 26 {
-        load_in_memory(&mut env, &context, &decrypted_dex)
-    } else {
-        load_file_landing(&mut env, &context, &decrypted_dex)
-    };
+    let class_loader = env.call_method(&context, "getClassLoader", "()Ljava/lang/ClassLoader;", &[]).unwrap().l().unwrap();
 
-    if let Err(e) = res {
+    if let Err(e) = load_dex_core(&mut env, &apk_path, &cache_path_str, &class_loader, sdk_int) {
         error!("nativeLoadDex (Provider) failed: {:?}", e);
         let _ = env.exception_clear();
     }
+}
+
+fn load_dex_core(
+    env: &mut JNIEnv,
+    apk_path: &str,
+    cache_path: &str,
+    class_loader: &JObject,
+    sdk_int: jint,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let decrypted_dex = extract_payload(apk_path)?;
+    
+    if sdk_int >= 26 {
+        load_in_memory(env, cache_path, class_loader, &decrypted_dex)
+    } else {
+        load_file_landing(env, cache_path, class_loader, &decrypted_dex)
+    }.map_err(|e| e.into())
 }
 
 fn get_package_code_path(env: &mut JNIEnv, context: &JObject) -> Result<String, jni::errors::Error> {
@@ -236,7 +260,7 @@ fn extract_payload(path: &str) -> Result<Vec<(String, Vec<u8>)>, Box<dyn std::er
     Ok(results)
 }
 
-fn load_in_memory(env: &mut JNIEnv, context: &JObject, file_list: &[(String, Vec<u8>)]) -> Result<(), jni::errors::Error> {
+fn load_in_memory(env: &mut JNIEnv, cache_path: &str, target_loader: &JObject, file_list: &[(String, Vec<u8>)]) -> Result<(), jni::errors::Error> {
     info!("load_in_memory called with {} items", file_list.len());
     // 1. Separate DEXs and Libs
     let mut dex_buffers = Vec::new();
@@ -244,15 +268,12 @@ fn load_in_memory(env: &mut JNIEnv, context: &JObject, file_list: &[(String, Vec
     let current_abi = get_current_abi();
     debug!("Current ABI: {}", current_abi);
 
-    // Only extract libs for current ABI
-    // Packer stores as "lib/<abi>/libname.so"
     let lib_prefix = format!("lib/{}/", current_abi);
 
     for (name, data) in file_list {
         if name.ends_with(".dex") {
              dex_buffers.push(data);
         } else if name.starts_with(&lib_prefix) && name.ends_with(".so") {
-             // Extract filename
              let filename = name.strip_prefix(&lib_prefix).unwrap_or(name);
              lib_buffers.push((filename, data));
         }
@@ -262,11 +283,6 @@ fn load_in_memory(env: &mut JNIEnv, context: &JObject, file_list: &[(String, Vec
 
     // 2. Extract Libs to Cache
     debug!("Extracting libs to cache...");
-    let cache_dir = env.call_method(context, "getCacheDir", "()Ljava/io/File;", &[])?.l()?;
-    let path_obj = env.call_method(&cache_dir, "getAbsolutePath", "()Ljava/lang/String;", &[])?.l()?;
-    let path_jstr: JString = path_obj.into();
-    let cache_path: String = env.get_string(&path_jstr)?.into();
-    
     let libs_dir = format!("{}/native_libs", cache_path);
     std::fs::create_dir_all(&libs_dir).unwrap_or(());
 
@@ -281,10 +297,6 @@ fn load_in_memory(env: &mut JNIEnv, context: &JObject, file_list: &[(String, Vec
     // 3. Create ByteBuffer[] for DEXs
     if dex_buffers.is_empty() {
         warn!("No DEX files to load in memory!");
-        // We still replace classloader if we extracted libs? 
-        // Actually, if no DEXs, we might just be loading libs.
-        // But replacing classloader with a "null" one is dangerous.
-        // Let's just return Ok if no DEXs?
         return Ok(());
     }
 
@@ -307,18 +319,10 @@ fn load_in_memory(env: &mut JNIEnv, context: &JObject, file_list: &[(String, Vec
 
     // 4. Create InMemoryDexClassLoader
     debug!("Instantiating InMemoryDexClassLoader...");
-    let parent_loader = env.call_method(
-        context, 
-        "getClassLoader", 
-        "()Ljava/lang/ClassLoader;", 
-        &[]
-    )?.l()?;
 
     let dex_loader_cls = env.find_class("dalvik/system/InMemoryDexClassLoader")?;
     let buffer_array_obj: JObject = buffer_array.into();
 
-    // Try finding constructor with library search path (API 27+)
-    // public InMemoryDexClassLoader (ByteBuffer[] dexBuffers, String librarySearchPath, ClassLoader parent)
     let ctor_sig_with_lib = "([Ljava/nio/ByteBuffer;Ljava/lang/String;Ljava/lang/ClassLoader;)V";
     
     let libs_dir_j = env.new_string(&libs_dir)?;
@@ -330,39 +334,25 @@ fn load_in_memory(env: &mut JNIEnv, context: &JObject, file_list: &[(String, Vec
         &[
             JValue::Object(&buffer_array_obj),
             JValue::Object(&libs_dir_obj),
-            JValue::Object(&parent_loader)
+            JValue::Object(target_loader)
         ]
     );
 
     let loader = match loader_res {
         Ok(l) => l,
         Err(_) => {
-            // Fallback to 2-arg constructor (API 26) - Libs won't be loaded automatically
             let _ = env.exception_clear();
             env.new_object(
                 &dex_loader_cls,
                 "([Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V",
-                &[JValue::Object(&buffer_array_obj), JValue::Object(&parent_loader)]
+                &[JValue::Object(&buffer_array_obj), JValue::Object(target_loader)]
             )?
         }
     };
 
     // 5. Inject Dex Elements into Parent Loader (Hotfix style)
-    // Instead of replacing the loader, we patch the existing one.
-    inject_dex_elements(env, &loader, &parent_loader)?;
+    inject_dex_elements(env, &loader, target_loader)?;
     
-    // Diagnostic
-    let test_class_name = "javax.inject.Provider";
-    let test_jstr = env.new_string(test_class_name)?;
-    // Try loading from parent now (since we injected)
-    match env.call_method(&parent_loader, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", &[JValue::Object(&test_jstr.into())]) {
-        Ok(_) => info!("shell: Diagnostic: Successfully loaded {} from PARENT loader (Injection verified)", test_class_name),
-        Err(_) => {
-            let _ = env.exception_clear();
-            warn!("shell: Diagnostic: Failed to load {} from PARENT loader", test_class_name);
-        }
-    }
-
     info!("load_in_memory: Completion successful");
     Ok(())
 }
@@ -380,14 +370,7 @@ fn get_current_abi() -> &'static str {
     return "unknown";
 }
 
-fn load_file_landing(env: &mut JNIEnv, context: &JObject, file_list: &[(String, Vec<u8>)]) -> Result<(), jni::errors::Error> {
-    // 1. Get cache dir
-    let cache_dir = env.call_method(context, "getCacheDir", "()Ljava/io/File;", &[])?.l()?;
-    
-    let path_obj = env.call_method(&cache_dir, "getAbsolutePath", "()Ljava/lang/String;", &[])?.l()?;
-    let path_jstr: JString = path_obj.into();
-    let cache_path: String = env.get_string(&path_jstr)?.into();
-    
+fn load_file_landing(env: &mut JNIEnv, cache_path: &str, target_loader: &JObject, file_list: &[(String, Vec<u8>)]) -> Result<(), jni::errors::Error> {
     let dex_cache_dir = format!("{}/dex_landing", cache_path);
     std::fs::create_dir_all(&dex_cache_dir).unwrap_or(());
 
@@ -416,15 +399,12 @@ fn load_file_landing(env: &mut JNIEnv, context: &JObject, file_list: &[(String, 
         }
     }
     
-    // Join paths with :
     let joined_paths = dex_paths.join(":");
     
     // 3. Create DexClassLoader
-    // public DexClassLoader (String dexPath, String optimizedDirectory, String librarySearchPath, ClassLoader parent)
     let dex_path_j = env.new_string(&joined_paths)?;
     let libs_dir_j = env.new_string(&libs_dir)?;
     let null_j = JObject::null();
-    let parent_loader = env.call_method(context, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])?.l()?;
     
     let loader_cls = env.find_class("dalvik/system/DexClassLoader")?;
     let loader = env.new_object(
@@ -432,14 +412,13 @@ fn load_file_landing(env: &mut JNIEnv, context: &JObject, file_list: &[(String, 
         "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/ClassLoader;)V",
         &[
             JValue::Object(&dex_path_j.into()), 
-            JValue::Object(&null_j), // optimizedDirectory (deprecated/null)
-            JValue::Object(&libs_dir_j.into()), // librarySearchPath
-            JValue::Object(&parent_loader)
+            JValue::Object(&null_j),
+            JValue::Object(&libs_dir_j.into()),
+            JValue::Object(target_loader)
         ]
     )?;
     
-    // 4. Inject Dex Elements (Hotfix)
-    inject_dex_elements(env, &loader, &parent_loader)?;
+    inject_dex_elements(env, &loader, target_loader)?;
 
     Ok(())
 }
@@ -447,21 +426,14 @@ fn load_file_landing(env: &mut JNIEnv, context: &JObject, file_list: &[(String, 
 fn inject_dex_elements(env: &mut JNIEnv, source_loader: &JObject, target_loader: &JObject) -> Result<(), jni::errors::Error> {
     info!("shell: inject_dex_elements starting...");
     
-    // 1. Get pathList from source
     let source_path_list = env.get_field(source_loader, "pathList", "Ldalvik/system/DexPathList;")?.l()?;
-
-    // 2. Get pathList from target
     let target_path_list = env.get_field(target_loader, "pathList", "Ldalvik/system/DexPathList;")?.l()?;
 
-    // 3. Get dexElements from source
     let source_elements_obj = env.get_field(source_path_list, "dexElements", "[Ldalvik/system/DexPathList$Element;")?.l()?;
     let source_array: JObjectArray = source_elements_obj.into();
 
-    // 4. Get dexElements from target
     let target_elements_obj = env.get_field(&target_path_list, "dexElements", "[Ldalvik/system/DexPathList$Element;")?.l()?;
     let target_array: JObjectArray = target_elements_obj.into();
-    
-    // 5. Concatenate arrays (Target + Source) or (Source + Target)
     
     let source_len = env.get_array_length(&source_array)?;
     let target_len = env.get_array_length(&target_array)?;
@@ -472,19 +444,16 @@ fn inject_dex_elements(env: &mut JNIEnv, source_loader: &JObject, target_loader:
     let total_len = source_len + target_len;
     let new_array = env.new_object_array(total_len, element_cls, JObject::null())?;
     
-    // Copy target (original) first
     for i in 0..target_len {
         let elem = env.get_object_array_element(&target_array, i)?;
         env.set_object_array_element(&new_array, i, elem)?;
     }
     
-    // Append source (new)
     for i in 0..source_len {
         let elem = env.get_object_array_element(&source_array, i)?;
         env.set_object_array_element(&new_array, target_len + i, elem)?;
     }
     
-    // 6. Set dexElements on target pathList
     let new_array_obj = JObject::from(new_array);
     env.set_field(
         target_path_list,

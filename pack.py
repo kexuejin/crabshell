@@ -117,6 +117,25 @@ def build_packer():
     subprocess.check_call(["cargo", "build", "--release"], cwd=PACKER_DIR)
 
 
+def patch_shell_loader_constants(original_app: str, original_factory: str):
+    print(f"Patching Shell loader constants: App={original_app}, Factory={original_factory}")
+    factory_java = os.path.join(SHELL_PROJECT_DIR, "app/src/main/java/com/kapp/shell/ShellComponentFactory.java")
+    if not os.path.exists(factory_java):
+        print(f"Warning: {factory_java} not found, skipping constant patching")
+        return
+
+    with open(factory_java, "r") as f:
+        content = f.read()
+
+    if original_app:
+        content = content.replace("REPLACE_ORIGINAL_APP", original_app)
+    if original_factory:
+        content = content.replace("REPLACE_ORIGINAL_FACTORY", original_factory)
+
+    with open(factory_java, "w") as f:
+        f.write(content)
+
+
 def build_shell():
     print("Building Shell (Native)...")
     env = os.environ.copy()
@@ -241,7 +260,7 @@ def ensure_bootstrap_provider(application: ET.Element, provider_class: str):
     provider.set(ANDROID_INIT_ORDER, "1000")
 
 
-def decode_and_patch_target_manifest(target_apk: str, temp_dir: str) -> Tuple[str, Optional[str]]:
+def decode_and_patch_target_manifest(target_apk: str, temp_dir: str) -> Tuple[str, Optional[str], str, str]:
     apktool_cmd = ensure_apktool_cmd()
 
     decoded_dir = os.path.join(temp_dir, "target_decoded")
@@ -255,7 +274,9 @@ def decode_and_patch_target_manifest(target_apk: str, temp_dir: str) -> Tuple[st
     res_dir = os.path.join(decoded_dir, "res")
     
     provider_class = "com.kapp.shell.BootstrapProvider"
+    shell_factory_class = "com.kapp.shell.ShellComponentFactory"
     meta_key = "kapp.original_application"
+    factory_meta_key = "kapp.original_factory"
 
     ET.register_namespace("android", ANDROID_NS)
     tree = ET.parse(manifest_path)
@@ -265,23 +286,38 @@ def decode_and_patch_target_manifest(target_apk: str, temp_dir: str) -> Tuple[st
     if application is None:
         raise RuntimeError("No <application> element found in AndroidManifest.xml")
 
+    android_app_factory = f"{{{ANDROID_NS}}}appComponentFactory"
+    original_factory = application.attrib.get(android_app_factory, "")
+    if original_factory:
+        print(f"Original appComponentFactory: '{original_factory}'")
+        application.set(android_app_factory, shell_factory_class)
+
     original_app = application.attrib.get(ANDROID_NAME, "")
     print(f"Original application: '{original_app}'")
     
     # Replace the application class with our shell
     application.set(ANDROID_NAME, "com.kapp.shell.ShellApplication")
 
-    meta_node = None
+    # Inject original app metadata
+    original_app_meta = None
+    original_factory_meta = None
     for child in application.findall("meta-data"):
-        if child.attrib.get(ANDROID_NAME) == meta_key:
-            meta_node = child
-            break
+        name = child.attrib.get(ANDROID_NAME)
+        if name == meta_key:
+            original_app_meta = child
+        elif name == factory_meta_key:
+            original_factory_meta = child
 
-    if meta_node is None:
-        meta_node = ET.SubElement(application, "meta-data")
+    if original_app_meta is None:
+        original_app_meta = ET.SubElement(application, "meta-data")
+    original_app_meta.set(ANDROID_NAME, meta_key)
+    original_app_meta.set(ANDROID_VALUE, original_app)
 
-    meta_node.set(ANDROID_NAME, meta_key)
-    meta_node.set(ANDROID_VALUE, original_app)
+    if original_factory:
+        if original_factory_meta is None:
+            original_factory_meta = ET.SubElement(application, "meta-data")
+        original_factory_meta.set(ANDROID_NAME, factory_meta_key)
+        original_factory_meta.set(ANDROID_VALUE, original_factory)
 
     ensure_bootstrap_provider(application, provider_class)
 
@@ -315,7 +351,7 @@ def decode_and_patch_target_manifest(target_apk: str, temp_dir: str) -> Tuple[st
     # string pool than the valid binary XML files we are copying from the original APK.
     # Mixing rebuilt ARSC with original binary XMLs causes Resources$NotFoundException.
     # So we return None for resources_arsc to force packer to use the original one.
-    return patched_manifest, None
+    return patched_manifest, None, original_app, original_factory
 
 
 def extract_keep_classes_from_decoded_manifest(decoded_dir: str) -> list[str]:
@@ -341,10 +377,10 @@ def extract_keep_classes_from_decoded_manifest(decoded_dir: str) -> list[str]:
 
     # We generally only need to keep the appComponentFactory in plaintext because 
     # the system loads it before our ShellApplication. 
-    # The original application (android:name) is loaded by our shell AFTER decryption.
-    factory = application.attrib.get(android_app_factory, "")
-    if factory:
-        values.append(factory.strip())
+    # BUT with ShellComponentFactory in the loader, we don't need to keep the target's factory.
+    # factory = application.attrib.get(android_app_factory, "")
+    # if factory:
+    #     values.append(factory.strip())
 
     deduped = []
     seen = set()
@@ -532,15 +568,19 @@ def main():
 
     generate_key()
 
-    if not skip_build:
-        build_packer()
-        build_shell()
-
-    bootstrap_apk = get_shell_apk_path()
-
     with tempfile.TemporaryDirectory(prefix="kapp-") as temp_dir:
         decoded_dir = os.path.join(temp_dir, "target_decoded")
-        patched_manifest, resources_arsc = decode_and_patch_target_manifest(target, temp_dir)
+        # We need to decode and patch the manifest to find original app/factory
+        patched_manifest, resources_arsc, original_app, original_factory = decode_and_patch_target_manifest(target, temp_dir)
+        
+        if not skip_build:
+            build_packer()
+            # Patch shell source with actual target app/factory names
+            patch_shell_loader_constants(original_app, original_factory)
+            build_shell()
+
+        bootstrap_apk = get_shell_apk_path()
+        
         keep_classes = extract_keep_classes_from_decoded_manifest(decoded_dir)
         manual_keep_classes = args.keep_class or config.get("keep_class", [])
         if isinstance(manual_keep_classes, str):

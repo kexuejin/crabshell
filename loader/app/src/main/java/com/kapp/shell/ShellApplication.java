@@ -18,31 +18,54 @@ public class ShellApplication extends Application {
         }
     }
 
+    private static boolean sDexLoaded = false;
+
     // Native method to load DEX from memory or file
     private native void nativeLoadDex(Context context, int version);
+
+    // Native method to load DEX using ApplicationInfo (earlier than
+    // attachBaseContext)
+    public static native void nativeLoadDexWithAppInfo(android.content.pm.ApplicationInfo appInfo, ClassLoader cl,
+            int version);
+
+    public static synchronized void ensureDexLoaded(Context context) {
+        if (sDexLoaded)
+            return;
+        new ShellApplication().nativeLoadDex(context, android.os.Build.VERSION.SDK_INT);
+        sDexLoaded = true;
+    }
+
+    public static synchronized void ensureDexLoaded(android.content.pm.ApplicationInfo appInfo, ClassLoader cl) {
+        if (sDexLoaded)
+            return;
+        nativeLoadDexWithAppInfo(appInfo, cl, android.os.Build.VERSION.SDK_INT);
+        sDexLoaded = true;
+    }
 
     @Override
     protected void attachBaseContext(Context base) {
         super.attachBaseContext(base);
         Log.d(TAG, "attachBaseContext: Starting shell logic");
-
-        // Determine Android version to choose loading strategy
-        // 0 for Gen 1 (File) or Gen 2 (Memory) based on API level in native code
-        nativeLoadDex(base, android.os.Build.VERSION.SDK_INT);
+        ensureDexLoaded(base);
     }
 
     @Override
     public void onCreate() {
         super.onCreate();
         Log.d(TAG, "onCreate: ShellApplication started");
+        ensureDexLoaded(getApplicationContext());
 
         try {
-            android.content.pm.ApplicationInfo appInfo = getPackageManager().getApplicationInfo(getPackageName(),
-                    android.content.pm.PackageManager.GET_META_DATA);
-            String originalAppName = appInfo.metaData.getString("kapp.original_application");
+            String originalAppName = ShellComponentFactory.ORIGINAL_APP;
+            if (originalAppName == null || originalAppName.isEmpty()
+                    || originalAppName.equals("REPLACE_ORIGINAL_APP")) {
+                android.content.pm.ApplicationInfo appInfo = getPackageManager().getApplicationInfo(getPackageName(),
+                        android.content.pm.PackageManager.GET_META_DATA);
+                originalAppName = appInfo.metaData.getString("kapp.original_application");
+            }
 
             if (originalAppName == null) {
-                Log.e(TAG, "onCreate: No original application class found in metadata");
+                Log.e(TAG, "onCreate: No original application class found");
                 return;
             }
 

@@ -38,8 +38,8 @@ venv/
 env/
 
 # Logs and Temp folders
-*_decoded/
-*_decoded_*/
+*decoded*
+*decode*
 temp_dir/
 packer_output*
 pid_*_logs/
