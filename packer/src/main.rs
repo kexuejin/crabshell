@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use zip::{write::FileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
 mod config;
-use config::AES_KEY;
+use config::get_aes_key;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -455,7 +455,7 @@ fn inject_bootstrap_libs(bootstrap_lib_dir: &Path, writer: &mut ZipWriter<File>)
 }
 
 fn encrypt_payload(data: &[u8]) -> anyhow::Result<(Vec<u8>, [u8; 12])> {
-    let key = *AES_KEY;
+    let key = get_aes_key();
     let cipher = Aes256Gcm::new(&key.into());
 
     let mut nonce_bytes = [0u8; 12];

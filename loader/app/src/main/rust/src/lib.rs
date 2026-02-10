@@ -11,7 +11,7 @@ use std::io::{Read, Write, Seek, SeekFrom};
 use zip::ZipArchive;
 
 mod config;
-use config::AES_KEY;
+use config::get_aes_key;
 
 #[macro_use]
 extern crate log;
@@ -290,7 +290,7 @@ fn extract_payload(path: &str) -> Result<Vec<(String, Vec<u8>)>, Box<dyn std::er
 
     file.seek(SeekFrom::Start(payload_start))?;
     
-    let key = *AES_KEY;
+    let key = get_aes_key();
     let cipher = Aes256Gcm::new(&key.into());
     let mut results = Vec::new();
 
