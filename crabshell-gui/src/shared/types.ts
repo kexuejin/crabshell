@@ -2,14 +2,6 @@ export interface HardeningConfig {
     inputFile: string;
     outputFile: string;
     outputFormat: 'auto' | 'apk' | 'aab';
-    options: {
-        dexEncryption: boolean;
-        assetEncryption: boolean;
-        antiDebugging: boolean;
-        integrityChecks: boolean;
-        stringObfuscation: boolean;
-        keyObfuscation: boolean;
-    };
     advanced: {
         keepClasses: string[];
         keepPrefixes: string[];

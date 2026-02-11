@@ -166,7 +166,7 @@ fn start_hardening(
     emit_log(
         &app,
         "info",
-        &format!("Running: python3 {}", args.join(" ")),
+        &format!("Running: python3 {}", redact_cli_args_for_log(&args)),
     );
 
     let mut cmd = Command::new("python3");
@@ -294,6 +294,39 @@ fn start_hardening(
     });
 
     Ok(())
+}
+
+fn redact_cli_args_for_log(args: &[String]) -> String {
+    let sensitive_flags = ["--ks-pass", "--key-pass", "--ks-key-pass"];
+    let mut rendered: Vec<String> = Vec::with_capacity(args.len());
+    let mut index = 0usize;
+
+    while index < args.len() {
+        let current = &args[index];
+        if sensitive_flags.contains(&current.as_str()) {
+            rendered.push(current.clone());
+            if index + 1 < args.len() {
+                rendered.push("******".to_string());
+                index += 2;
+                continue;
+            }
+            index += 1;
+            continue;
+        }
+
+        if let Some((key, _)) = current.split_once('=') {
+            if sensitive_flags.contains(&key) {
+                rendered.push(format!("{key}=******"));
+                index += 1;
+                continue;
+            }
+        }
+
+        rendered.push(current.clone());
+        index += 1;
+    }
+
+    rendered.join(" ")
 }
 
 fn detect_repo_root() -> Option<PathBuf> {
@@ -570,4 +603,23 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn redact_sensitive_cli_args_masks_password_values() {
+        let args = vec![
+            "pack.py".to_string(),
+            "--target".to_string(),
+            "input.apk".to_string(),
+            "--ks-pass".to_string(),
+            "pass:secret123".to_string(),
+            "--key-alias".to_string(),
+            "demo".to_string(),
+        ];
+        let rendered = super::redact_cli_args_for_log(&args);
+        assert!(rendered.contains("--ks-pass ******"));
+        assert!(!rendered.contains("secret123"));
+    }
 }

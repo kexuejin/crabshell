@@ -5,6 +5,7 @@ import android.content.Context;
 import android.util.Log;
 
 import java.io.File;
+import java.util.zip.ZipFile;
 
 public class ShellApplication extends Application {
     private static final String TAG = "ShellApplication";
@@ -56,15 +57,18 @@ public class ShellApplication extends Application {
         ensureDexLoaded(getApplicationContext());
 
         try {
-            String originalAppName = ShellComponentFactory.ORIGINAL_APP;
-            if (originalAppName == null || originalAppName.isEmpty()
-                    || originalAppName.equals("REPLACE_ORIGINAL_APP")) {
-                android.content.pm.ApplicationInfo appInfo = getPackageManager().getApplicationInfo(getPackageName(),
-                        android.content.pm.PackageManager.GET_META_DATA);
+            String originalAppName = null;
+            android.content.pm.ApplicationInfo appInfo = getPackageManager().getApplicationInfo(getPackageName(),
+                    android.content.pm.PackageManager.GET_META_DATA);
+            if (appInfo.metaData != null) {
                 originalAppName = appInfo.metaData.getString("kapp.original_application");
             }
 
-            if (originalAppName == null) {
+            if (originalAppName == null || originalAppName.isEmpty()) {
+                originalAppName = ShellComponentFactory.ORIGINAL_APP;
+            }
+
+            if (originalAppName == null || originalAppName.isEmpty()) {
                 Log.e(TAG, "onCreate: No original application class found");
                 return;
             }
@@ -103,6 +107,16 @@ public class ShellApplication extends Application {
                 Log.w(TAG, "injectAssets: kapp_assets.zip does not exist, skipping");
                 return;
             }
+            if (assetsZip.length() == 0L) {
+                Log.w(TAG, "injectAssets: kapp_assets.zip is empty, skipping");
+                return;
+            }
+            try (ZipFile zipFile = new ZipFile(assetsZip)) {
+                if (zipFile.size() == 0) {
+                    Log.w(TAG, "injectAssets: kapp_assets.zip has no entries, skipping");
+                    return;
+                }
+            }
 
             android.content.res.AssetManager am = context.getAssets();
             java.lang.reflect.Method addAssetPath = android.content.res.AssetManager.class
@@ -114,6 +128,9 @@ public class ShellApplication extends Application {
 
             Object cookie = addAssetPath.invoke(am, path);
             Log.d(TAG, "injectAssets: Result cookie: " + cookie);
+            if (cookie instanceof Integer && ((Integer) cookie) == 0) {
+                Log.w(TAG, "injectAssets: addAssetPath returned 0, treating as no-op");
+            }
 
         } catch (Exception e) {
             Log.e(TAG, "injectAssets: Failed to inject assets", e);

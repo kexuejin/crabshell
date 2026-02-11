@@ -19,7 +19,6 @@ import KeyboardArrowDownIcon from '@mui/icons-material/KeyboardArrowDown';
 import { useTranslation } from 'react-i18next';
 import FileInput from './components/FileInput';
 import OutputSettings from './components/OutputSettings';
-import HardeningOptions from './components/HardeningOptions';
 import SigningConfig from './components/SigningConfig';
 import ActionButtons from './components/ActionButtons';
 import LanguageSwitcher from './components/LanguageSwitcher';
@@ -70,14 +69,6 @@ const App: React.FC = () => {
     inputFile: '',
     outputFile: 'protected.aab',
     outputFormat: 'auto',
-    options: {
-      dexEncryption: true,
-      assetEncryption: true,
-      antiDebugging: true,
-      integrityChecks: true,
-      stringObfuscation: true,
-      keyObfuscation: true,
-    },
     advanced: {
       keepClasses: [],
       keepPrefixes: [],
@@ -272,15 +263,9 @@ const App: React.FC = () => {
           />
         </Paper>
 
-        <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 1, mb: 1 }}>
-          <Paper elevation={0} sx={sectionCardSx}>
-            <HardeningOptions options={config.options} onChange={(options) => setConfig({ ...config, options })} disabled={isProcessing} />
-          </Paper>
-
-          <Paper elevation={0} sx={sectionCardSx}>
-            <SigningConfig config={config.signing} onChange={(signing) => setConfig({ ...config, signing })} disabled={isProcessing} />
-          </Paper>
-        </Box>
+        <Paper elevation={0} sx={{ ...sectionCardSx, mb: 1 }}>
+          <SigningConfig config={config.signing} onChange={(signing) => setConfig({ ...config, signing })} disabled={isProcessing} />
+        </Paper>
 
         <Paper
           elevation={0}

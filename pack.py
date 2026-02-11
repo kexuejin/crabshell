@@ -2,6 +2,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import secrets
 import shutil
@@ -583,6 +584,49 @@ pub const EXPECTED_SIGNATURE_HASH: [u8; 32] = [{signature_hash_str}];
     print(f"Generated config -> {config_path}")
     print(f"Generated strings -> {strings_config_path}")
 
+
+def parse_rust_u8_array(source: str, const_name: str) -> bytes:
+    pattern = re.compile(
+        rf"const\s+{re.escape(const_name)}\s*:\s*\[u8;\s*32\]\s*=\s*\[(.*?)\];",
+        re.DOTALL,
+    )
+    match = pattern.search(source)
+    if not match:
+        raise ValueError(f"Missing {const_name} in generated config")
+
+    values: list[int] = []
+    for item in match.group(1).split(","):
+        token = item.strip()
+        if not token:
+            continue
+        values.append(int(token, 0))
+
+    if len(values) != 32:
+        raise ValueError(f"{const_name} must have 32 bytes, got {len(values)}")
+    if any(value < 0 or value > 0xFF for value in values):
+        raise ValueError(f"{const_name} contains out-of-range byte value")
+
+    return bytes(values)
+
+
+def load_key_bytes_from_generated_config(config_path: str) -> bytes:
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
+    source = Path(config_path).read_text(encoding="utf-8")
+    key_part_1 = parse_rust_u8_array(source, "KEY_PART_1")
+    key_part_2 = parse_rust_u8_array(source, "KEY_PART_2")
+    return bytes(part_1 ^ part_2 for part_1, part_2 in zip(key_part_1, key_part_2))
+
+
+def select_key_bytes(skip_build: bool, packer_config_path: str) -> bytes:
+    if not skip_build:
+        return secrets.token_bytes(32)
+
+    key_bytes = load_key_bytes_from_generated_config(packer_config_path)
+    print(f"--skip-build enabled, reusing existing key from {packer_config_path}")
+    return key_bytes
+
 def get_apk_signature_hash(apk_path: str) -> Optional[bytes]:
     apksigner = find_android_build_tool("apksigner")
     if not apksigner:
@@ -706,10 +750,22 @@ def patch_shell_loader_constants(original_app: str, original_factory: str):
     with open(factory_java, "r") as f:
         content = f.read()
 
-    if original_app:
-        content = content.replace("REPLACE_ORIGINAL_APP", original_app)
-    if original_factory:
-        content = content.replace("REPLACE_ORIGINAL_FACTORY", original_factory)
+    original_app_value = original_app or ""
+    original_factory_value = original_factory or ""
+
+    app_pattern = r'(public\s+static\s+final\s+String\s+ORIGINAL_APP\s*=\s*)".*?";'
+    factory_pattern = r'(public\s+static\s+final\s+String\s+ORIGINAL_FACTORY\s*=\s*)".*?";'
+
+    app_replacement = r'\1"' + original_app_value.replace("\\", "\\\\").replace('"', '\\"') + '";'
+    factory_replacement = r'\1"' + original_factory_value.replace("\\", "\\\\").replace('"', '\\"') + '";'
+
+    content, app_count = re.subn(app_pattern, app_replacement, content, count=1)
+    content, factory_count = re.subn(factory_pattern, factory_replacement, content, count=1)
+
+    if app_count == 0:
+        content = content.replace("REPLACE_ORIGINAL_APP", original_app_value)
+    if factory_count == 0:
+        content = content.replace("REPLACE_ORIGINAL_FACTORY", original_factory_value)
 
     with open(factory_java, "w") as f:
         f.write(content)
@@ -862,14 +918,20 @@ def inline_manifest_meta_data_string_values(application: ET.Element, string_tabl
                 element.set(ANDROID_VALUE, resolved)
 
 
-def ensure_bootstrap_provider(application: ET.Element, provider_class: str):
+def ensure_bootstrap_provider(
+    application: ET.Element, provider_class: str, provider_authorities: str
+):
     for provider in application.findall("provider"):
-        if provider.attrib.get(ANDROID_NAME) == provider_class:
-            return
+        if provider.attrib.get(ANDROID_NAME) != provider_class:
+            continue
+        provider.set(ANDROID_AUTHORITIES, provider_authorities)
+        provider.set(ANDROID_EXPORTED, "false")
+        provider.set(ANDROID_INIT_ORDER, "1000")
+        return
 
     provider = ET.SubElement(application, "provider")
     provider.set(ANDROID_NAME, provider_class)
-    provider.set(ANDROID_AUTHORITIES, "${applicationId}.kapp-bootstrap")
+    provider.set(ANDROID_AUTHORITIES, provider_authorities)
     provider.set(ANDROID_EXPORTED, "false")
     provider.set(ANDROID_INIT_ORDER, "1000")
 
@@ -955,7 +1017,10 @@ def decode_and_patch_target_manifest(target_apk: str, temp_dir: str) -> Tuple[st
         original_factory_meta.set(ANDROID_NAME, factory_meta_key)
         original_factory_meta.set(ANDROID_VALUE, original_factory)
 
-    ensure_bootstrap_provider(application, provider_class)
+    package_name = (root.attrib.get("package") or "").strip()
+    if not package_name:
+        raise RuntimeError("Target manifest missing package attribute")
+    ensure_bootstrap_provider(application, provider_class, f"{package_name}.kapp-bootstrap")
 
     if not decoded_with_no_res and res_dir and os.path.exists(res_dir):
         strings = load_string_resources(res_dir)
@@ -970,20 +1035,25 @@ def decode_and_patch_target_manifest(target_apk: str, temp_dir: str) -> Tuple[st
 
     import zipfile
 
-    resources_arsc = os.path.join(temp_dir, "resources.arsc")
+    resources_arsc = None
+    use_rebuilt_resources = os.environ.get("CRABSHELL_USE_REBUILT_RESOURCES", "0") == "1"
 
     with zipfile.ZipFile(manifest_built_apk, "r") as zf:
         with zf.open("AndroidManifest.xml") as mf, open(patched_manifest, "wb") as out:
             out.write(mf.read())
 
-        try:
-            with zf.open("resources.arsc") as rsc, open(resources_arsc, "wb") as out:
-                out.write(rsc.read())
-        except KeyError:
-            print("Warning: resources.arsc not found in rebuilt APK.")
-            resources_arsc = None
+        if use_rebuilt_resources:
+            rebuilt_resources = os.path.join(temp_dir, "resources.arsc")
+            try:
+                with zf.open("resources.arsc") as rsc, open(rebuilt_resources, "wb") as out:
+                    out.write(rsc.read())
+                resources_arsc = rebuilt_resources
+            except KeyError:
+                print("Warning: resources.arsc not found in rebuilt APK.")
+        else:
+            print("Preserving original target resources.arsc (skip rebuilt resources replacement).")
 
-    return patched_manifest, None, original_app, original_factory
+    return patched_manifest, resources_arsc, original_app, original_factory
 
 
 def extract_keep_classes_from_decoded_manifest(decoded_dir: str) -> list[str]:
@@ -1335,7 +1405,7 @@ def load_config(config_path):
     return {}
 
 
-def main():
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="CrabShell Packer Automation Script")
     parser.add_argument("--config", default="kapp-config.json", help="Path to config file")
     parser.add_argument("--target", help="Path to the target APK to pack")
@@ -1345,13 +1415,108 @@ def main():
     parser.add_argument("--key-alias", help="Key alias")
     parser.add_argument("--no-sign", action="store_true", help="Skip APK signing")
     parser.add_argument("--skip-build", action="store_true", help="Skip building packer and shell")
-    parser.add_argument("--keep-class", action="append", help="Class names to keep in plaintext (can be specified multiple times)")
-    parser.add_argument("--keep-prefix", action="append", help="Package prefixes to keep in plaintext (can be specified multiple times)")
-    parser.add_argument("--keep-lib", action="append", help="Library names (without lib prefix or .so) to keep in plaintext (can be specified multiple times)")
-    parser.add_argument("--encrypt-asset", action="append", help="Pattern of assets to encrypt (e.g. assets/*.js)")
-    parser.add_argument("--output-format", choices=['auto', 'apk', 'aab'], default='auto',
-                       help="Output format (auto=same as input, apk=force APK, aab=force AAB)")
+    parser.add_argument(
+        "--keep-class",
+        action="append",
+        help="Class names to keep in plaintext (can be specified multiple times)",
+    )
+    parser.add_argument(
+        "--keep-prefix",
+        action="append",
+        help="Package prefixes to keep in plaintext (can be specified multiple times)",
+    )
+    parser.add_argument(
+        "--keep-lib",
+        action="append",
+        help="Library names (without lib prefix or .so) to keep in plaintext (can be specified multiple times)",
+    )
+    parser.add_argument(
+        "--encrypt-asset", action="append", help="Pattern of assets to encrypt (e.g. assets/*.js)"
+    )
+    parser.add_argument(
+        "--output-format",
+        choices=["auto", "apk", "aab"],
+        default="auto",
+        help="Output format (auto=same as input, apk=force APK, aab=force AAB)",
+    )
+    return parser
 
+
+def normalize_cli_list(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    return [item for item in value if item]
+
+
+def normalize_output_path(target: str, output: str) -> str:
+    if os.path.isdir(output) or output.endswith(os.sep):
+        target_base = os.path.splitext(os.path.basename(target))[0]
+        return os.path.join(output, f"{target_base}-protected.apk")
+    return output
+
+
+def resolve_output_format_and_extension(
+    target: str, output: str, requested_output_format: str
+) -> tuple[bool, str, str]:
+    is_aab_input = is_aab_file(target)
+    output_format = requested_output_format
+    if output_format == "auto":
+        output_format = "aab" if is_aab_input else "apk"
+
+    if output_format == "aab" and not output.endswith(".aab"):
+        output = f"{os.path.splitext(output)[0]}.aab"
+    elif output_format == "apk" and not output.endswith(".apk"):
+        output = f"{os.path.splitext(output)[0]}.apk"
+
+    return is_aab_input, output_format, output
+
+
+def collect_runtime_lists(args, config: dict, decoded_dir: str) -> tuple[list[str], list[str], list[str], list[str]]:
+    keep_classes = extract_keep_classes_from_decoded_manifest(decoded_dir)
+    keep_classes.extend(normalize_cli_list(args.keep_class or config.get("keep_class")))
+
+    keep_prefixes = normalize_cli_list(args.keep_prefix or config.get("keep_prefix"))
+
+    keep_libs = normalize_cli_list(args.keep_lib or config.get("keep_lib"))
+    if "mmkv" not in keep_libs:
+        keep_libs.append("mmkv")
+
+    encrypt_assets = normalize_cli_list(args.encrypt_asset or config.get("encrypt_asset"))
+    return keep_classes, keep_prefixes, keep_libs, encrypt_assets
+
+
+def maybe_build_toolchain(skip_build: bool, original_app: str, original_factory: str):
+    if skip_build:
+        return
+    build_packer()
+    patch_shell_loader_constants(original_app, original_factory)
+    build_shell()
+
+
+def prepare_target_manifest(
+    target: str, is_aab_input: bool, temp_dir: str
+) -> tuple[str, Optional[str], str, Optional[str], str, str]:
+    original_aab_path = None
+    target_apk = target
+
+    if is_aab_input:
+        print(f"Detected AAB file: {target}")
+        original_aab_path = target
+        temp_apk = os.path.join(temp_dir, "universal_from_aab.apk")
+        print("Converting AAB to universal APK...")
+        target_apk = convert_aab_to_apk(target, temp_apk, temp_dir)
+        print(f"Converted to: {target_apk}")
+
+    patched_manifest, resources_arsc, original_app, original_factory = decode_and_patch_target_manifest(
+        target_apk, temp_dir
+    )
+    return target_apk, original_aab_path, patched_manifest, resources_arsc, original_app, original_factory
+
+
+def main():
+    parser = build_arg_parser()
     args = parser.parse_args()
 
     normalize_java_env()
@@ -1370,79 +1535,39 @@ def main():
         print("Error: Target APK not specified (use --target or config file).")
         return
 
-    # Normalize output path. If user passes a directory, place a default file inside it.
-    if os.path.isdir(output) or output.endswith(os.sep):
-        target_base = os.path.splitext(os.path.basename(target))[0]
-        output = os.path.join(output, f"{target_base}-protected.apk")
+    output = normalize_output_path(target, output)
 
     output_parent = os.path.dirname(output)
     if output_parent:
         os.makedirs(output_parent, exist_ok=True)
 
-    key_bytes = secrets.token_bytes(32)
+    packer_config_path = os.path.join(PACKER_DIR, "src", "config.rs")
+    key_bytes = select_key_bytes(skip_build, packer_config_path)
     # Initial config generation for packer build
     generate_config(os.path.join(RUST_SHELL_DIR, "src", "config.rs"), key_bytes)
-    generate_config(os.path.join(PACKER_DIR, "src", "config.rs"), key_bytes)
+    generate_config(packer_config_path, key_bytes)
 
-    # Detect AAB input and determine output format
-    is_aab_input = is_aab_file(target)
-    output_format = args.output_format
-    
-    # Auto-detect output format
-    if output_format == 'auto':
-        output_format = 'aab' if is_aab_input else 'apk'
-    
-    # Ensure output extension matches format
-    if output_format == 'aab' and not output.endswith('.aab'):
-        output = output.replace('.apk', '.aab')
-    elif output_format == 'apk' and not output.endswith('.apk'):
-        output = output.replace('.aab', '.apk')
+    is_aab_input, output_format, output = resolve_output_format_and_extension(
+        target, output, args.output_format
+    )
 
     with tempfile.TemporaryDirectory(prefix="kapp-") as temp_dir:
-        original_aab_path = None
-        
-        # Convert AAB to APK if needed
-        if is_aab_input:
-            print(f"Detected AAB file: {target}")
-            original_aab_path = target
-            temp_apk = os.path.join(temp_dir, "universal_from_aab.apk")
-            print("Converting AAB to universal APK...")
-            target = convert_aab_to_apk(target, temp_apk, temp_dir)
-            print(f"Converted to: {target}")
-        
         decoded_dir = os.path.join(temp_dir, "target_decoded")
-        # We need to decode and patch the manifest to find original app/factory
-        patched_manifest, resources_arsc, original_app, original_factory = decode_and_patch_target_manifest(target, temp_dir)
-        
-        if not skip_build:
-            build_packer()
-            # Patch shell source with actual target app/factory names
-            patch_shell_loader_constants(original_app, original_factory)
-            build_shell()
+        (
+            target,
+            original_aab_path,
+            patched_manifest,
+            resources_arsc,
+            original_app,
+            original_factory,
+        ) = prepare_target_manifest(target, is_aab_input, temp_dir)
+
+        maybe_build_toolchain(skip_build, original_app, original_factory)
 
         bootstrap_apk = get_shell_apk_path()
-        
-        keep_classes = extract_keep_classes_from_decoded_manifest(decoded_dir)
-        manual_keep_classes = args.keep_class or config.get("keep_class", [])
-        if isinstance(manual_keep_classes, str):
-             manual_keep_classes = [manual_keep_classes]
-        keep_classes.extend(manual_keep_classes)
-        
-        keep_prefixes = []
-        manual_keep_prefixes = args.keep_prefix or config.get("keep_prefix", [])
-        if isinstance(manual_keep_prefixes, str):
-            manual_keep_prefixes = [manual_keep_prefixes]
-        keep_prefixes.extend(manual_keep_prefixes)
-        
-        keep_libs = args.keep_lib or config.get("keep_lib", [])
-        if isinstance(keep_libs, str):
-            keep_libs = [keep_libs]
-        if "mmkv" not in keep_libs:
-            keep_libs.append("mmkv")
-            
-        encrypt_assets = args.encrypt_asset or config.get("encrypt_asset", [])
-        if isinstance(encrypt_assets, str):
-            encrypt_assets = [encrypt_assets]
+        keep_classes, keep_prefixes, keep_libs, encrypt_assets = collect_runtime_lists(
+            args, config, decoded_dir
+        )
 
         signing_keystore, signing_ks_pass, signing_alias = resolve_signing(keystore, ks_pass, key_alias)
 

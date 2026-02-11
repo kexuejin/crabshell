@@ -8,6 +8,7 @@ use aes_gcm::{
 use std::os::raw::c_void;
 use std::fs::File;
 use std::io::{Read, Write, Seek, SeekFrom};
+use std::sync::atomic::{AtomicBool, Ordering};
 use zip::ZipArchive;
 
 mod config;
@@ -20,6 +21,23 @@ use sha2::{Sha256, Digest};
 #[macro_use]
 extern crate log;
 use android_logger::Config;
+
+static DEX_LOAD_MARKER: AtomicBool = AtomicBool::new(false);
+
+fn try_mark_dex_load_started() -> bool {
+    DEX_LOAD_MARKER
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+fn clear_dex_load_marker() {
+    DEX_LOAD_MARKER.store(false, Ordering::Release);
+}
+
+#[cfg(test)]
+fn clear_dex_load_marker_for_tests() {
+    clear_dex_load_marker();
+}
 
 #[no_mangle]
 pub extern "system" fn JNI_OnLoad(_vm: jni::JavaVM, _reserved: *mut c_void) -> jint {
@@ -64,157 +82,290 @@ fn check_debugger() {
 
     // 2. Check Ptrace (PTRACE_TRACEME)
     // If we can't trace ourselves, someone else is likely tracing us.
+    #[cfg(target_os = "android")]
     unsafe {
-        if libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) == -1 {
-             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-             if errno == 13 {
-                 // EACCES: likely SELinux restriction, not necessarily a debugger
-                 info!("{}", s!(strings_config::PTRACE_RESTRICTED));
-             } else {
-                 error!("{} ({})! {}", 
-                    s!(strings_config::DEBUG_DETECTED), 
+        if libc::ptrace(
+            libc::PTRACE_TRACEME,
+            0,
+            std::ptr::null_mut::<libc::c_void>(),
+            std::ptr::null_mut::<libc::c_void>(),
+        ) == -1
+        {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if errno == 13 {
+                // EACCES: likely SELinux restriction, not necessarily a debugger
+                info!("{}", s!(strings_config::PTRACE_RESTRICTED));
+            } else {
+                error!(
+                    "{} ({})! {}",
+                    s!(strings_config::DEBUG_DETECTED),
                     s!(strings_config::PTRACE_FAILED).replace("{}", &errno.to_string()),
-                    s!(strings_config::EXITING));
-                 // std::process::exit(1);
-             }
+                    s!(strings_config::EXITING)
+                );
+                // std::process::exit(1);
+            }
         } else {
             info!("{}", s!(strings_config::PTRACE_SUCCESS));
         }
     }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        debug!("Skipping ptrace check on non-Android target");
+    }
+}
+
+fn call_object_method<'local>(
+    env: &mut JNIEnv<'local>,
+    obj: &JObject<'local>,
+    method: &str,
+    sig: &str,
+) -> Result<JObject<'local>, jni::errors::Error> {
+    env.call_method(obj, method, sig, &[])?.l()
+}
+
+fn call_string_method<'local>(
+    env: &mut JNIEnv<'local>,
+    obj: &JObject<'local>,
+    method: &str,
+    sig: &str,
+) -> Result<String, jni::errors::Error> {
+    let value = call_object_method(env, obj, method, sig)?;
+    Ok(env.get_string(&JString::from(value))?.into())
+}
+
+fn get_string_field<'local>(
+    env: &mut JNIEnv<'local>,
+    obj: &JObject<'local>,
+    field: &str,
+) -> Result<String, jni::errors::Error> {
+    let value = env.get_field(obj, field, "Ljava/lang/String;")?.l()?;
+    Ok(env.get_string(&JString::from(value))?.into())
+}
+
+fn get_paths_and_loader_from_context<'local>(
+    env: &mut JNIEnv<'local>,
+    context: &JObject<'local>,
+) -> Result<(String, String, JObject<'local>), jni::errors::Error> {
+    let cache_dir = call_object_method(env, context, "getCacheDir", "()Ljava/io/File;")?;
+    let cache_path = call_string_method(env, &cache_dir, "getAbsolutePath", "()Ljava/lang/String;")?;
+
+    let class_loader = call_object_method(env, context, "getClassLoader", "()Ljava/lang/ClassLoader;")?;
+
+    let files_dir = call_object_method(env, context, "getFilesDir", "()Ljava/io/File;")?;
+    let data_dir = call_object_method(env, &files_dir, "getParentFile", "()Ljava/io/File;")?;
+    let data_path = call_string_method(env, &data_dir, "getAbsolutePath", "()Ljava/lang/String;")?;
+
+    Ok((cache_path, data_path, class_loader))
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_kapp_shell_ShellApplication_nativeLoadDex(
-    mut env: JNIEnv,
-    _this: JObject,
-    context: JObject,
+pub extern "system" fn Java_com_kapp_shell_ShellApplication_nativeLoadDex<'local>(
+    mut env: JNIEnv<'local>,
+    _this: JObject<'local>,
+    context: JObject<'local>,
     sdk_int: jint,
 ) {
     info!("{} {}", s!(strings_config::MSG_NATIVE_LOAD_DEX).replace("{}", ""), sdk_int);
+    if !try_mark_dex_load_started() {
+        info!("nativeLoadDex (Application): dex already loaded in process, skipping duplicate call");
+        return;
+    }
     let apk_path = match get_package_code_path(&mut env, &context) {
         Ok(path) => path,
         Err(e) => {
             error!("Failed to get package code path: {:?}", e);
             let _ = env.exception_clear();
+            clear_dex_load_marker();
             return;
         }
     };
-    
-    let cache_dir = env.call_method(&context, "getCacheDir", "()Ljava/io/File;", &[]).unwrap().l().unwrap();
-    let cache_path = env.call_method(&cache_dir, "getAbsolutePath", "()Ljava/lang/String;", &[]).unwrap().l().unwrap();
-    let cache_path_str: String = env.get_string(&cache_path.into()).unwrap().into();
 
-    let class_loader = env.call_method(&context, "getClassLoader", "()Ljava/lang/ClassLoader;", &[]).unwrap().l().unwrap();
+    let (cache_path_str, data_path_str, class_loader) =
+        match get_paths_and_loader_from_context(&mut env, &context) {
+            Ok(values) => values,
+            Err(e) => {
+                error!("nativeLoadDex (Application): failed to resolve paths/classloader: {:?}", e);
+                let _ = env.exception_clear();
+                clear_dex_load_marker();
+                return;
+            }
+        };
 
-    let files_dir = env.call_method(&context, "getFilesDir", "()Ljava/io/File;", &[]).unwrap().l().unwrap();
-    let data_dir_obj = env.call_method(&files_dir, "getParentFile", "()Ljava/io/File;", &[]).unwrap().l().unwrap();
-    let data_path_j = env.call_method(&data_dir_obj, "getAbsolutePath", "()Ljava/lang/String;", &[]).unwrap().l().unwrap();
-    let data_path_str: String = env.get_string(&data_path_j.into()).unwrap().into();
-
-    if let Err(e) = verify_integrity(&mut env, &context, &apk_path) {
+    if let Err(e) = verify_integrity(&mut env, &context) {
         error!("Integrity check failed: {:?}", e);
         // In a real hardened app, we should probably exit here.
         // std::process::exit(1);
     }
 
-    if let Err(e) = load_dex_core(&mut env, &apk_path, &cache_path_str, &data_path_str, &class_loader, sdk_int) {
+    let payload = match extract_payload(&apk_path, true) {
+        Ok(payload) => payload,
+        Err(e) => {
+            error!("Payload integrity failed: {:?}", e);
+            clear_dex_load_marker();
+            return;
+        }
+    };
+
+    if let Err(e) =
+        load_dex_core(&mut env, &cache_path_str, &data_path_str, &class_loader, &payload, sdk_int)
+    {
         error!("nativeLoadDex (Application) failed: {:?}", e);
         let _ = env.exception_clear();
+        clear_dex_load_marker();
     }
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_kapp_shell_ShellApplication_nativeLoadDexWithAppInfo(
-    mut env: JNIEnv,
-    _class: JClass,
-    app_info: JObject,
-    class_loader: JObject,
+pub extern "system" fn Java_com_kapp_shell_ShellApplication_nativeLoadDexWithAppInfo<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    app_info: JObject<'local>,
+    class_loader: JObject<'local>,
     sdk_int: jint,
 ) {
     info!("{} {}", s!(strings_config::MSG_NATIVE_LOAD_DEX).replace("{}", ""), sdk_int);
+    if !try_mark_dex_load_started() {
+        info!("nativeLoadDexWithAppInfo: dex already loaded in process, skipping duplicate call");
+        return;
+    }
     
     // 1. Get APK path and data dir from ApplicationInfo
-    let source_dir_j = env.get_field(&app_info, "sourceDir", "Ljava/lang/String;").unwrap().l().unwrap();
-    let apk_path: String = env.get_string(&source_dir_j.into()).unwrap().into();
-    
-    let data_dir_j = env.get_field(&app_info, "dataDir", "Ljava/lang/String;").unwrap().l().unwrap();
-    let data_dir: String = env.get_string(&data_dir_j.into()).unwrap().into();
+    let apk_path = match get_string_field(&mut env, &app_info, "sourceDir") {
+        Ok(value) => value,
+        Err(e) => {
+            error!("nativeLoadDexWithAppInfo: failed to read sourceDir: {:?}", e);
+            let _ = env.exception_clear();
+            clear_dex_load_marker();
+            return;
+        }
+    };
+
+    let data_dir = match get_string_field(&mut env, &app_info, "dataDir") {
+        Ok(value) => value,
+        Err(e) => {
+            error!("nativeLoadDexWithAppInfo: failed to read dataDir: {:?}", e);
+            let _ = env.exception_clear();
+            clear_dex_load_marker();
+            return;
+        }
+    };
     let cache_path_str = format!("{}/cache", data_dir);
-    std::fs::create_dir_all(&cache_path_str).unwrap_or(());
+    if let Err(e) = std::fs::create_dir_all(&cache_path_str) {
+        error!(
+            "nativeLoadDexWithAppInfo: failed to create cache dir {}: {}",
+            cache_path_str, e
+        );
+        clear_dex_load_marker();
+        return;
+    }
 
     // 2. Verify Integrity (Skip for now if we only have app_info, or pass JObject::null())
     // For now, we skip signature check here to avoid complexity of getting PM from app_info.
     // It will be verified in nativeLoadDex or BootstrapProvider anyway.
-    if let Err(e) = extract_payload(&apk_path, true) {
-        error!("Payload integrity failed: {:?}", e);
-        // std::process::exit(1);
-    }
+    let payload = match extract_payload(&apk_path, true) {
+        Ok(payload) => payload,
+        Err(e) => {
+            error!("Payload integrity failed: {:?}", e);
+            clear_dex_load_marker();
+            return;
+        }
+    };
 
     // 3. Load DEX using the modular core
-    if let Err(e) = load_dex_core(&mut env, &apk_path, &cache_path_str, &data_dir, &class_loader, sdk_int) {
+    if let Err(e) = load_dex_core(
+        &mut env,
+        &cache_path_str,
+        &data_dir,
+        &class_loader,
+        &payload,
+        sdk_int,
+    ) {
         error!("nativeLoadDexWithAppInfo failed: {:?}", e);
         let _ = env.exception_clear();
+        clear_dex_load_marker();
     }
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_kapp_shell_BootstrapProvider_nativeLoadDex(
-    mut env: JNIEnv,
-    _class: JClass,
-    context: JObject,
+pub extern "system" fn Java_com_kapp_shell_BootstrapProvider_nativeLoadDex<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    context: JObject<'local>,
     sdk_int: jint,
 ) {
     info!("nativeLoadDex (Provider) called for SDK {}", sdk_int);
+    if !try_mark_dex_load_started() {
+        info!("nativeLoadDex (Provider): dex already loaded in process, skipping duplicate call");
+        return;
+    }
     let apk_path = match get_package_code_path(&mut env, &context) {
         Ok(path) => path,
         Err(e) => {
             error!("Failed to get package code path (Provider): {:?}", e);
             let _ = env.exception_clear();
+            clear_dex_load_marker();
             return;
         }
     };
 
-    let cache_dir = env.call_method(&context, "getCacheDir", "()Ljava/io/File;", &[]).unwrap().l().unwrap();
-    let cache_path = env.call_method(&cache_dir, "getAbsolutePath", "()Ljava/lang/String;", &[]).unwrap().l().unwrap();
-    let cache_path_str: String = env.get_string(&cache_path.into()).unwrap().into();
+    let (cache_path_str, data_path_str, class_loader) =
+        match get_paths_and_loader_from_context(&mut env, &context) {
+            Ok(values) => values,
+            Err(e) => {
+                error!("nativeLoadDex (Provider): failed to resolve paths/classloader: {:?}", e);
+                let _ = env.exception_clear();
+                clear_dex_load_marker();
+                return;
+            }
+        };
 
-    let class_loader = env.call_method(&context, "getClassLoader", "()Ljava/lang/ClassLoader;", &[]).unwrap().l().unwrap();
-
-    let files_dir = env.call_method(&context, "getFilesDir", "()Ljava/io/File;", &[]).unwrap().l().unwrap();
-    let data_dir_obj = env.call_method(&files_dir, "getParentFile", "()Ljava/io/File;", &[]).unwrap().l().unwrap();
-    let data_path_j = env.call_method(&data_dir_obj, "getAbsolutePath", "()Ljava/lang/String;", &[]).unwrap().l().unwrap();
-    let data_path_str: String = env.get_string(&data_path_j.into()).unwrap().into();
-
-    if let Err(e) = verify_integrity(&mut env, &context, &apk_path) {
+    if let Err(e) = verify_integrity(&mut env, &context) {
         error!("Integrity check failed: {:?}", e);
         // std::process::exit(1);
     }
 
-    if let Err(e) = load_dex_core(&mut env, &apk_path, &cache_path_str, &data_path_str, &class_loader, sdk_int) {
+    let payload = match extract_payload(&apk_path, true) {
+        Ok(payload) => payload,
+        Err(e) => {
+            error!("Payload integrity failed: {:?}", e);
+            clear_dex_load_marker();
+            return;
+        }
+    };
+
+    if let Err(e) =
+        load_dex_core(&mut env, &cache_path_str, &data_path_str, &class_loader, &payload, sdk_int)
+    {
         error!("nativeLoadDex (Provider) failed: {:?}", e);
         let _ = env.exception_clear();
+        clear_dex_load_marker();
     }
 }
 
 fn load_dex_core(
     env: &mut JNIEnv,
-    apk_path: &str,
     cache_path: &str,
     data_path: &str,
     class_loader: &JObject,
+    payload: &[(String, Vec<u8>)],
     sdk_int: jint,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let payload = extract_payload(apk_path, true)?;
-    
     // 1. Extract Assets
-    extract_assets_core(data_path, &payload)?;
+    extract_assets_core(data_path, payload)?;
 
     // 2. Load DEX and Libs
+    // NOTE:
+    // We intentionally use file-landing on all SDKs. In-memory mode can trigger
+    // "Attempt to register dex file ... with multiple class loaders" for some
+    // multi-process/provider startup sequences.
     if sdk_int >= 26 {
-        load_in_memory(env, cache_path, class_loader, &payload)
-    } else {
-        load_file_landing(env, cache_path, class_loader, &payload)
-    }.map_err(|e| e.into())
+        info!(
+            "load_dex_core: using file-landing mode on SDK {} for class-loader compatibility",
+            sdk_int
+        );
+    }
+    load_file_landing(env, cache_path, class_loader, payload).map_err(|e| e.into())
 }
 
 fn extract_assets_core(
@@ -265,7 +416,6 @@ fn get_package_code_path(env: &mut JNIEnv, context: &JObject) -> Result<String, 
 fn verify_integrity(
     env: &mut JNIEnv,
     context: &JObject,
-    apk_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Verify APK Signature
     info!("Verifying APK signature...");
@@ -298,12 +448,6 @@ fn verify_integrity(
     } else {
         warn!("No signatures found in PackageInfo.");
     }
-
-    // 2. Verify Payload Hash
-    info!("Verifying payload hash...");
-    // We already do this inside extract_payload if we pass verify=true
-    let _ = extract_payload(apk_path, true)?;
-    info!("Payload integrity verified.");
 
     Ok(())
 }
@@ -552,6 +696,15 @@ fn load_file_landing(env: &mut JNIEnv, cache_path: &str, target_loader: &JObject
              let dex_path = format!("{}/payload_{}.dex", dex_cache_dir, i);
              if let Ok(mut file) = File::create(&dex_path) {
                 let _ = file.write_all(data);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(metadata) = std::fs::metadata(&dex_path) {
+                        let mut permissions = metadata.permissions();
+                        permissions.set_mode(0o444);
+                        let _ = std::fs::set_permissions(&dex_path, permissions);
+                    }
+                }
              }
              dex_paths.push(dex_path);
         } else if name.starts_with(&lib_prefix) && name.ends_with(".so") {
@@ -564,25 +717,55 @@ fn load_file_landing(env: &mut JNIEnv, cache_path: &str, target_loader: &JObject
     }
     
     let joined_paths = dex_paths.join(":");
-    
-    // 3. Create DexClassLoader
+
+    if joined_paths.is_empty() {
+        warn!("No dex paths extracted in load_file_landing");
+        return Ok(());
+    }
+
+    // 3. Add dex paths directly into target loader to avoid cross-classloader dex
+    // ownership conflicts.
     let dex_path_j = env.new_string(&joined_paths)?;
+    let dex_path_obj: JObject = dex_path_j.into();
+
+    let add_dex_result = env.call_method(
+        target_loader,
+        "addDexPath",
+        "(Ljava/lang/String;Z)V",
+        &[JValue::Object(&dex_path_obj), JValue::Bool(0)],
+    );
+    if add_dex_result.is_err() {
+        let _ = env.exception_clear();
+        env.call_method(
+            target_loader,
+            "addDexPath",
+            "(Ljava/lang/String;)V",
+            &[JValue::Object(&dex_path_obj)],
+        )?;
+    }
+
+    // 4. Best-effort add native lib search path for extracted .so files
     let libs_dir_j = env.new_string(&libs_dir)?;
-    let null_j = JObject::null();
-    
-    let loader_cls = env.find_class("dalvik/system/DexClassLoader")?;
-    let loader = env.new_object(
-        loader_cls,
-        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/ClassLoader;)V",
-        &[
-            JValue::Object(&dex_path_j.into()), 
-            JValue::Object(&null_j),
-            JValue::Object(&libs_dir_j.into()),
-            JValue::Object(target_loader)
-        ]
+    let libs_dir_obj: JObject = libs_dir_j.into();
+    let array_list_cls = env.find_class("java/util/ArrayList")?;
+    let native_paths = env.new_object(&array_list_cls, "()V", &[])?;
+    env.call_method(
+        &native_paths,
+        "add",
+        "(Ljava/lang/Object;)Z",
+        &[JValue::Object(&libs_dir_obj)],
     )?;
-    
-    inject_dex_elements(env, &loader, target_loader)?;
+
+    let add_native_result = env.call_method(
+        target_loader,
+        "addNativePath",
+        "(Ljava/util/Collection;)V",
+        &[JValue::Object(&native_paths)],
+    );
+    if add_native_result.is_err() {
+        let _ = env.exception_clear();
+        debug!("addNativePath not available on target loader, continue without it");
+    }
 
     Ok(())
 }
@@ -628,4 +811,20 @@ fn inject_dex_elements(env: &mut JNIEnv, source_loader: &JObject, target_loader:
 
     info!("shell: inject_dex_elements completed successfully");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clear_dex_load_marker_for_tests, try_mark_dex_load_started};
+
+    #[test]
+    fn dex_load_marker_allows_only_first_call() {
+        clear_dex_load_marker_for_tests();
+
+        assert!(try_mark_dex_load_started());
+        assert!(!try_mark_dex_load_started());
+
+        clear_dex_load_marker_for_tests();
+        assert!(try_mark_dex_load_started());
+    }
 }

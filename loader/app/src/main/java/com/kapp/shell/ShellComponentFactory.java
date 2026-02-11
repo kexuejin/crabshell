@@ -12,7 +12,7 @@ import android.util.Log;
 
 public class ShellComponentFactory extends AppComponentFactory {
     private static final String TAG = "ShellComponentFactory";
-    public static final String ORIGINAL_APP = "com.flashget.kidscontrol.SandApp";
+    public static final String ORIGINAL_APP = "com.flashget.parentalcontrol.SandApp";
     public static final String ORIGINAL_FACTORY = "androidx.core.app.CoreComponentFactory";
     private static ApplicationInfo sAppInfo;
     private AppComponentFactory originalFactory;
@@ -27,11 +27,20 @@ public class ShellComponentFactory extends AppComponentFactory {
             return;
 
         try {
-            String originalFactoryName = ORIGINAL_FACTORY;
+            String originalFactoryName = null;
 
-            Log.e(TAG, "ensureDelegate: Original factory name from constant: " + originalFactoryName);
+            if (sAppInfo != null && sAppInfo.metaData != null) {
+                originalFactoryName = sAppInfo.metaData.getString("kapp.original_factory");
+            }
+
+            if (originalFactoryName == null || originalFactoryName.isEmpty()) {
+                originalFactoryName = ORIGINAL_FACTORY;
+            }
+
+            Log.e(TAG, "ensureDelegate: Original factory name resolved: " + originalFactoryName);
 
             if (originalFactoryName != null && !originalFactoryName.isEmpty()
+                    && !originalFactoryName.equals("REPLACE_ORIGINAL_FACTORY")
                     && !originalFactoryName.equals("androidx.core.app.CoreComponentFactory")) {
                 Log.e(TAG, "ensureDelegate: Instantiating original factory: " + originalFactoryName);
                 Class<?> clazz = cl.loadClass(originalFactoryName);
