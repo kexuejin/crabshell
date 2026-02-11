@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import urllib.request
 import xml.etree.ElementTree as ET
+import zipfile
 from typing import Optional, Tuple
 
 RUST_SHELL_DIR = "loader/app/src/main/rust"
@@ -21,6 +22,116 @@ ANDROID_VALUE = f"{{{ANDROID_NS}}}value"
 ANDROID_AUTHORITIES = f"{{{ANDROID_NS}}}authorities"
 ANDROID_EXPORTED = f"{{{ANDROID_NS}}}exported"
 ANDROID_INIT_ORDER = f"{{{ANDROID_NS}}}initOrder"
+
+
+def is_aab_file(path: str) -> bool:
+    """Check if file is an AAB by looking for BundleConfig.pb"""
+    try:
+        with zipfile.ZipFile(path, 'r') as z:
+            return 'BundleConfig.pb' in z.namelist()
+    except:
+        return False
+
+
+def find_bundletool() -> str:
+    """Find bundletool.jar or download it"""
+    bundletool_jar = os.path.expanduser('~/bundletool.jar')
+    if os.path.exists(bundletool_jar):
+        return bundletool_jar
+    
+    # Download if not found
+    print("Downloading bundletool...")
+    url = 'https://github.com/google/bundletool/releases/download/1.17.2/bundletool-all-1.17.2.jar'
+    urllib.request.urlretrieve(url, bundletool_jar)
+    return bundletool_jar
+
+
+def convert_aab_to_apk(aab_path: str, output_apk: str, temp_dir: str) -> str:
+    """Convert AAB to universal APK using bundletool"""
+    bundletool = find_bundletool()
+    
+    # Build universal APKs (unsigned for now)
+    apks_path = os.path.join(temp_dir, 'temp.apks')
+    cmd = [
+        'java', '-jar', bundletool,
+        'build-apks',
+        '--bundle', aab_path,
+        '--output', apks_path,
+        '--mode', 'universal'
+    ]
+    subprocess.check_call(cmd)
+    
+    # Extract universal APK from .apks
+    with zipfile.ZipFile(apks_path, 'r') as z:
+        z.extract('universal.apk', temp_dir)
+    
+    universal_apk = os.path.join(temp_dir, 'universal.apk')
+    shutil.move(universal_apk, output_apk)
+    
+    return output_apk
+
+
+def convert_apk_to_aab(apk_path: str, output_aab: str, original_aab: str, temp_dir: str) -> str:
+    """Convert hardened APK back to AAB format"""
+    # Extract original AAB structure
+    aab_extract_dir = os.path.join(temp_dir, 'aab_structure')
+    os.makedirs(aab_extract_dir, exist_ok=True)
+    
+    with zipfile.ZipFile(original_aab, 'r') as z:
+        z.extractall(aab_extract_dir)
+    
+    # Extract hardened APK
+    apk_extract_dir = os.path.join(temp_dir, 'hardened_apk')
+    os.makedirs(apk_extract_dir, exist_ok=True)
+    
+    with zipfile.ZipFile(apk_path, 'r') as z:
+        z.extractall(apk_extract_dir)
+    
+    # Replace base module contents with hardened APK contents
+    base_dir = os.path.join(aab_extract_dir, 'base')
+    
+    # Copy hardened DEX files
+    base_dex_dir = os.path.join(base_dir, 'dex')
+    if os.path.exists(base_dex_dir):
+        shutil.rmtree(base_dex_dir)
+    os.makedirs(base_dex_dir, exist_ok=True)
+    
+    for item in os.listdir(apk_extract_dir):
+        if item.endswith('.dex'):
+            src = os.path.join(apk_extract_dir, item)
+            dst = os.path.join(base_dex_dir, item)
+            shutil.copy2(src, dst)
+    
+    # Copy hardened native libraries
+    apk_lib_dir = os.path.join(apk_extract_dir, 'lib')
+    if os.path.exists(apk_lib_dir):
+        base_lib_dir = os.path.join(base_dir, 'lib')
+        if os.path.exists(base_lib_dir):
+            shutil.rmtree(base_lib_dir)
+        shutil.copytree(apk_lib_dir, base_lib_dir)
+    
+    # Copy hardened assets
+    apk_assets_dir = os.path.join(apk_extract_dir, 'assets')
+    if os.path.exists(apk_assets_dir):
+        base_assets_dir = os.path.join(base_dir, 'assets')
+        if os.path.exists(base_assets_dir):
+            shutil.rmtree(base_assets_dir)
+        shutil.copytree(apk_assets_dir, base_assets_dir)
+    
+    # NOTE: We do NOT copy the manifest from the hardened APK
+    # The original AAB manifest is already patched (from the AAB-to-APK conversion)
+    # and is in the correct protobuf format that bundletool expects.
+    # The hardened APK has a binary XML manifest which is incompatible with AAB format.
+    
+    # Rebuild AAB
+    with zipfile.ZipFile(output_aab, 'w', zipfile.ZIP_DEFLATED) as z:
+        for root, dirs, files in os.walk(aab_extract_dir):
+            for file in files:
+                file_path = os.path.join(root, file)
+                arcname = os.path.relpath(file_path, aab_extract_dir)
+                z.write(file_path, arcname)
+    
+    return output_aab
 
 
 def generate_config(config_path: str, key_bytes: bytes, payload_hash: bytes = None, signature_hash: bytes = None):
@@ -694,6 +805,8 @@ def main():
     parser.add_argument("--keep-prefix", action="append", help="Package prefixes to keep in plaintext (can be specified multiple times)")
     parser.add_argument("--keep-lib", action="append", help="Library names (without lib prefix or .so) to keep in plaintext (can be specified multiple times)")
     parser.add_argument("--encrypt-asset", action="append", help="Pattern of assets to encrypt (e.g. assets/*.js)")
+    parser.add_argument("--output-format", choices=['auto', 'apk', 'aab'], default='auto',
+                       help="Output format (auto=same as input, apk=force APK, aab=force AAB)")
 
     args = parser.parse_args()
 
@@ -725,7 +838,32 @@ def main():
     generate_config(os.path.join(RUST_SHELL_DIR, "src", "config.rs"), key_bytes)
     generate_config(os.path.join(PACKER_DIR, "src", "config.rs"), key_bytes)
 
+    # Detect AAB input and determine output format
+    is_aab_input = is_aab_file(target)
+    output_format = args.output_format
+    
+    # Auto-detect output format
+    if output_format == 'auto':
+        output_format = 'aab' if is_aab_input else 'apk'
+    
+    # Ensure output extension matches format
+    if output_format == 'aab' and not output.endswith('.aab'):
+        output = output.replace('.apk', '.aab')
+    elif output_format == 'apk' and not output.endswith('.apk'):
+        output = output.replace('.aab', '.apk')
+
     with tempfile.TemporaryDirectory(prefix="kapp-") as temp_dir:
+        original_aab_path = None
+        
+        # Convert AAB to APK if needed
+        if is_aab_input:
+            print(f"Detected AAB file: {target}")
+            original_aab_path = target
+            temp_apk = os.path.join(temp_dir, "universal_from_aab.apk")
+            print("Converting AAB to universal APK...")
+            target = convert_aab_to_apk(target, temp_apk, temp_dir)
+            print(f"Converted to: {target}")
+        
         decoded_dir = os.path.join(temp_dir, "target_decoded")
         # We need to decode and patch the manifest to find original app/factory
         patched_manifest, resources_arsc, original_app, original_factory = decode_and_patch_target_manifest(target, temp_dir)
@@ -769,8 +907,18 @@ def main():
             print("Skipping signing (--no-sign). Output APK may fail to install.")
         else:
             sign_apk(output, signing_keystore, signing_ks_pass, signing_alias)
+        
+        # Convert back to AAB if needed
+        if output_format == 'aab' and original_aab_path:
+            print("Converting hardened APK back to AAB...")
+            temp_apk = output
+            # Output already has correct extension from earlier logic
+            if not output.endswith('.aab'):
+                output = output.replace('.apk', '.aab') if output.endswith('.apk') else output + '.aab'
+            convert_apk_to_aab(temp_apk, output, original_aab_path, temp_dir)
+            print(f"Created hardened AAB: {output}")
 
-    print(f"Done! Protected APK: {output}")
+    print(f"Done! Protected {output_format.upper()}: {output}")
 
 
 if __name__ == "__main__":
