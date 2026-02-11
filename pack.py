@@ -30,6 +30,7 @@ UBER_APK_SIGNER_JAR_URL = (
     f"https://github.com/patrickfav/uber-apk-signer/releases/download/v{UBER_APK_SIGNER_VERSION}/uber-apk-signer-{UBER_APK_SIGNER_VERSION}.jar"
 )
 TOOL_DOWNLOAD_RETRIES = int(os.environ.get("TOOL_DOWNLOAD_RETRIES", "3"))
+TOOL_DOWNLOAD_TIMEOUT = int(os.environ.get("TOOL_DOWNLOAD_TIMEOUT", "60"))
 ANDROID_NS = "http://schemas.android.com/apk/res/android"
 ANDROID_NAME = f"{{{ANDROID_NS}}}name"
 ANDROID_VALUE = f"{{{ANDROID_NS}}}value"
@@ -37,6 +38,20 @@ ANDROID_AUTHORITIES = f"{{{ANDROID_NS}}}authorities"
 ANDROID_EXPORTED = f"{{{ANDROID_NS}}}exported"
 ANDROID_INIT_ORDER = f"{{{ANDROID_NS}}}initOrder"
 
+
+
+def run_checked_command(command: list[str], action: str, cwd: Optional[str] = None, env: Optional[dict[str, str]] = None) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True)
+    if result.returncode == 0:
+        return result
+
+    stdout_tail = "\n".join(result.stdout.splitlines()[-120:])
+    stderr_tail = "\n".join(result.stderr.splitlines()[-120:])
+    raise RuntimeError(
+        f"{action} failed. command={command}\n"
+        f"--- stdout (tail) ---\n{stdout_tail}\n"
+        f"--- stderr (tail) ---\n{stderr_tail}"
+    )
 
 
 def get_toolchain_dir() -> str:
@@ -103,7 +118,7 @@ def download_file_with_retries(url: str, target_path: str, retries: int = TOOL_D
         try:
             print(f"[toolchain] download-start {target_name} attempt={attempt}/{retries}")
 
-            with urllib.request.urlopen(url) as response, open(temp_path, "wb") as output:
+            with urllib.request.urlopen(url, timeout=TOOL_DOWNLOAD_TIMEOUT) as response, open(temp_path, "wb") as output:
                 content_length_header = response.headers.get("Content-Length")
                 total_bytes = int(content_length_header) if content_length_header else 0
                 downloaded_bytes = 0
@@ -234,7 +249,7 @@ def is_aab_file(path: str) -> bool:
     try:
         with zipfile.ZipFile(path, 'r') as z:
             return 'BundleConfig.pb' in z.namelist()
-    except:
+    except (zipfile.BadZipFile, OSError):
         return False
 
 
@@ -585,9 +600,7 @@ def get_apk_signature_hash(apk_path: str) -> Optional[bytes]:
     return None
 
 def calculate_sha256(file_path: str) -> bytes:
-    import hashlib
-    with open(file_path, "rb") as f:
-        return hashlib.sha256(f.read()).digest()
+    return bytes.fromhex(compute_sha256(file_path))
 
 
 def ensure_tool_exists(tool: str):
@@ -680,7 +693,7 @@ def build_packer():
     cargo_bin = os.path.expanduser("~/.cargo/bin")
     if cargo_bin not in env.get("PATH", ""):
         env["PATH"] = f"{cargo_bin}:{env.get('PATH', '')}"
-    subprocess.check_call(["cargo", "build", "--release"], cwd=PACKER_DIR, env=env)
+    run_checked_command(["cargo", "build", "--release"], "Build Packer", cwd=PACKER_DIR, env=env)
 
 
 def patch_shell_loader_constants(original_app: str, original_factory: str):
@@ -763,8 +776,9 @@ def build_shell():
                 "Could not detect Android NDK. Please set ANDROID_NDK_HOME to your NDK installation."
             )
 
-    subprocess.check_call(
+    run_checked_command(
         ["cargo", "ndk", "-t", "arm64-v8a", "-t", "armeabi-v7a", "-o", "../jniLibs", "build", "--release"],
+        "Build Shell (Native)",
         cwd=RUST_SHELL_DIR,
         env=env,
     )
@@ -790,7 +804,7 @@ def build_shell():
         )
 
     print("Building Packer...")
-    subprocess.check_call(["cargo", "build", "--release"], cwd=PACKER_DIR, env=env)
+    run_checked_command(["cargo", "build", "--release"], "Build Packer", cwd=PACKER_DIR, env=env)
 
 
 def get_shell_apk_path() -> str:
@@ -1077,7 +1091,7 @@ def pack_apk(
     # Phase 1: Generate payload only
     print("Phase 1: Generating payload for hashing...")
     payload_cmd = cmd + ["--payload-out", payload_path]
-    subprocess.check_call(payload_cmd)
+    run_checked_command(payload_cmd, "Generate payload")
     
     payload_hash = calculate_sha256(payload_path)
     print(f"Payload hash: {payload_hash.hex()}")
@@ -1119,7 +1133,7 @@ def pack_apk(
     # Phase 2: Final pack using pre-generated payload
     print("Phase 2: Final packing...")
     final_cmd = cmd + ["--payload-in", payload_path]
-    subprocess.check_call(final_cmd)
+    run_checked_command(final_cmd, "Final packing")
 
 
 def sign_apk(apk_path, keystore, ks_pass, key_alias):

@@ -133,6 +133,22 @@ If you prefer to build components manually:
     ./gradlew assembleRelease
     ```
 
+## CI / GitHub Actions
+
+Workflow: `.github/workflows/build.yml`
+
+- `core-build` (Ubuntu): runs `verify.sh` for non-GUI pipeline (packer + loader checks).
+- `gui-package` (matrix): builds Tauri GUI bundles on all desktop platforms and uploads artifacts:
+  - macOS: `CrabShell.app` + `CrabShell_*.dmg`
+  - Linux: `.deb` + `.AppImage`
+  - Windows: `.msi` + NSIS `.exe`
+
+- `release.yml`: release workflow for GUI packages (all desktop platforms):
+  - Trigger by tag push: `v*`
+  - Or manual trigger: `workflow_dispatch` with inputs: `tag`, `prerelease`
+  - Publishes `.dmg`, `.deb`, `.AppImage`, `.msi`, `.exe` to GitHub Releases
+  - Release assets are normalized as `CrabShell-<tag>-<original-file-name>`
+
 ## Disclaimer
 
 This tool is for **educational and research purposes only**. Do not use it for malicious purposes. The authors are not responsible for any misuse of this software.

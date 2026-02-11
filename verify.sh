@@ -25,11 +25,24 @@ fi
 # 2. Check Android NDK targets
 echo "Checking Android targets..."
 TARGETS=$(rustup target list --installed)
-if [[ $TARGETS == *"aarch64-linux-android"* ]]; then
+REQUIRED_TARGETS=(
+    "aarch64-linux-android"
+    "armv7-linux-androideabi"
+    "x86_64-linux-android"
+)
+MISSING_TARGETS=()
+
+for target in "${REQUIRED_TARGETS[@]}"; do
+    if [[ $TARGETS != *"$target"* ]]; then
+        MISSING_TARGETS+=("$target")
+    fi
+done
+
+if [ ${#MISSING_TARGETS[@]} -eq 0 ]; then
     echo -e "${GREEN}[OK] Android targets installed.${NC}"
 else
-    echo -e "${RED}[FAIL] Android targets missing.${NC}"
-    echo "Please run: rustup target add aarch64-linux-android armv7-linux-androideabi"
+    echo -e "${RED}[FAIL] Android targets missing: ${MISSING_TARGETS[*]}${NC}"
+    echo "Please run: rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android"
     exit 1
 fi
 
