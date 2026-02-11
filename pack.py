@@ -1,27 +1,232 @@
 import argparse
+import hashlib
 import json
 import os
+from pathlib import Path
 import secrets
 import shutil
 import subprocess
 import tempfile
+import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple, Union
 
 RUST_SHELL_DIR = "loader/app/src/main/rust"
 PACKER_DIR = "packer"
 SHELL_PROJECT_DIR = "loader"
+TOOLCHAIN_SUBDIR = "crabshell-toolchain"
+BUNDLETOOL_VERSION = os.environ.get("BUNDLETOOL_VERSION", "1.17.2")
 APKTOOL_VERSION = os.environ.get("APKTOOL_VERSION", "2.11.1")
-APKTOOL_JAR_URL = f"https://github.com/iBotPeaches/Apktool/releases/download/v{APKTOOL_VERSION}/apktool_{APKTOOL_VERSION}.jar"
-from pathlib import Path
+UBER_APK_SIGNER_VERSION = os.environ.get("UBER_APK_SIGNER_VERSION", "1.3.0")
+BUNDLETOOL_JAR_URL = (
+    f"https://github.com/google/bundletool/releases/download/{BUNDLETOOL_VERSION}/bundletool-all-{BUNDLETOOL_VERSION}.jar"
+)
+APKTOOL_JAR_URL = (
+    f"https://github.com/iBotPeaches/Apktool/releases/download/v{APKTOOL_VERSION}/apktool_{APKTOOL_VERSION}.jar"
+)
+UBER_APK_SIGNER_JAR_URL = (
+    f"https://github.com/patrickfav/uber-apk-signer/releases/download/v{UBER_APK_SIGNER_VERSION}/uber-apk-signer-{UBER_APK_SIGNER_VERSION}.jar"
+)
+TOOL_DOWNLOAD_RETRIES = int(os.environ.get("TOOL_DOWNLOAD_RETRIES", "3"))
 ANDROID_NS = "http://schemas.android.com/apk/res/android"
 ANDROID_NAME = f"{{{ANDROID_NS}}}name"
 ANDROID_VALUE = f"{{{ANDROID_NS}}}value"
 ANDROID_AUTHORITIES = f"{{{ANDROID_NS}}}authorities"
 ANDROID_EXPORTED = f"{{{ANDROID_NS}}}exported"
 ANDROID_INIT_ORDER = f"{{{ANDROID_NS}}}initOrder"
+
+
+
+def get_toolchain_dir() -> str:
+    env_dir = os.environ.get("CRABSHELL_TOOLCHAIN_DIR")
+    if env_dir:
+        path = os.path.expanduser(env_dir)
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    codex_home = os.environ.get("CODEX_HOME", os.path.expanduser("~/.codex"))
+    path = os.path.join(codex_home, "tools", TOOLCHAIN_SUBDIR)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def format_bytes(size: int) -> str:
+    units = ["B", "KB", "MB", "GB"]
+    value = float(size)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)}{unit}"
+            return f"{value:.1f}{unit}"
+        value /= 1024
+    return f"{int(size)}B"
+
+
+def resolve_download_urls(primary_url: str, env_var: str) -> list[str]:
+    raw = os.environ.get(env_var, "").strip()
+    urls: list[str] = []
+    if raw:
+        for item in raw.split(","):
+            candidate = item.strip()
+            if candidate:
+                urls.append(candidate)
+
+    if primary_url not in urls:
+        urls.append(primary_url)
+
+    return urls
+
+
+def download_with_url_fallback(urls: Sequence[str], target_path: str, retries: int = TOOL_DOWNLOAD_RETRIES) -> None:
+    errors: list[str] = []
+    for url in urls:
+        try:
+            download_file_with_retries(url, target_path, retries=retries)
+            return
+        except Exception as error:
+            errors.append(f"{url} -> {error}")
+            print(f"[toolchain] source-failed {url} reason={error}")
+
+    raise RuntimeError(
+        "All download sources failed for "
+        f"{os.path.basename(target_path)}: {' | '.join(errors)}"
+    )
+
+
+def download_file_with_retries(url: str, target_path: str, retries: int = TOOL_DOWNLOAD_RETRIES) -> None:
+    target_name = os.path.basename(target_path)
+
+    for attempt in range(1, retries + 1):
+        temp_path = f"{target_path}.part"
+        try:
+            print(f"[toolchain] download-start {target_name} attempt={attempt}/{retries}")
+
+            with urllib.request.urlopen(url) as response, open(temp_path, "wb") as output:
+                content_length_header = response.headers.get("Content-Length")
+                total_bytes = int(content_length_header) if content_length_header else 0
+                downloaded_bytes = 0
+                last_percent = -1
+
+                while True:
+                    chunk = response.read(1024 * 256)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    downloaded_bytes += len(chunk)
+
+                    if total_bytes > 0:
+                        percent = int(downloaded_bytes * 100 / total_bytes)
+                        if percent >= 100:
+                            percent = 100
+                        if percent != last_percent and (percent % 10 == 0 or percent == 100):
+                            print(
+                                f"[toolchain] download-progress {target_name} {percent}% "
+                                f"({format_bytes(downloaded_bytes)}/{format_bytes(total_bytes)})"
+                            )
+                            last_percent = percent
+                    elif downloaded_bytes % (1024 * 1024 * 4) < 1024 * 256:
+                        print(
+                            f"[toolchain] download-progress {target_name} "
+                            f"{format_bytes(downloaded_bytes)}"
+                        )
+
+                if total_bytes > 0 and downloaded_bytes < total_bytes:
+                    raise urllib.error.ContentTooShortError(
+                        f"retrieval incomplete: got only {downloaded_bytes} out of {total_bytes} bytes",
+                        None,
+                    )
+
+            os.replace(temp_path, target_path)
+            print(f"[toolchain] download-done {target_name}")
+            return
+        except Exception as error:
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+
+            if attempt < retries:
+                print(
+                    f"[toolchain] download-retry {target_name} "
+                    f"attempt={attempt}/{retries} reason={error}"
+                )
+                continue
+
+            raise RuntimeError(
+                f"Failed to download {target_name} after {retries} attempts: {error}"
+            )
+
+
+def ensure_downloaded_file(url_or_urls: Union[str, Sequence[str]], target_path: str, sha256: Optional[str] = None) -> str:
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+
+    def validate_existing_file() -> bool:
+        if not os.path.exists(target_path):
+            return False
+
+        if sha256:
+            current = compute_sha256(target_path)
+            if current.lower() != sha256.lower():
+                print(f"Checksum mismatch for {target_path}, re-downloading...")
+                try:
+                    os.remove(target_path)
+                except Exception:
+                    pass
+                return False
+
+        if target_path.lower().endswith(".jar") and not is_valid_jar_file(target_path):
+            print(f"[toolchain] detected corrupt jar, re-downloading: {target_path}")
+            try:
+                os.remove(target_path)
+            except Exception:
+                pass
+            return False
+
+        return True
+
+    if validate_existing_file():
+        return target_path
+
+    urls = [url_or_urls] if isinstance(url_or_urls, str) else list(url_or_urls)
+    print(f"[toolchain] downloading {os.path.basename(target_path)} from {urls[0]}")
+    download_with_url_fallback(urls, target_path)
+
+    if not validate_existing_file():
+        raise RuntimeError(f"Downloaded file is invalid and could not be validated: {target_path}")
+
+    return target_path
+
+
+def compute_sha256(file_path: str) -> str:
+    digest = hashlib.sha256()
+    with open(file_path, "rb") as file:
+        while True:
+            chunk = file.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def is_executable_file(path: str) -> bool:
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def is_valid_jar_file(path: str) -> bool:
+    if not os.path.isfile(path):
+        return False
+    if not zipfile.is_zipfile(path):
+        return False
+
+    try:
+        with zipfile.ZipFile(path, "r") as jar_file:
+            bad_entry = jar_file.testzip()
+            return bad_entry is None
+    except Exception:
+        return False
 
 
 def is_aab_file(path: str) -> bool:
@@ -33,36 +238,177 @@ def is_aab_file(path: str) -> bool:
         return False
 
 
+def find_java_cmd() -> str:
+    """Find a usable Java executable."""
+    def _is_usable(java_path: str) -> bool:
+        try:
+            result = subprocess.run(
+                [java_path, "-version"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    # 1) JAVA_HOME explicitly set
+    java_home = os.environ.get("JAVA_HOME")
+    if java_home:
+        java_bin = os.path.join(java_home, "bin", "java")
+        if os.path.isfile(java_bin) and os.access(java_bin, os.X_OK) and _is_usable(java_bin):
+            return java_bin
+
+    # 2) java in PATH
+    java_in_path = shutil.which("java")
+    if java_in_path and _is_usable(java_in_path):
+        return java_in_path
+
+    # 3) common Homebrew/OpenJDK locations (works for GUI apps without shell env)
+    brew_candidates = [
+        "/opt/homebrew/opt/openjdk@21/bin/java",
+        "/opt/homebrew/opt/openjdk@17/bin/java",
+        "/opt/homebrew/opt/openjdk/bin/java",
+        "/usr/local/opt/openjdk@21/bin/java",
+        "/usr/local/opt/openjdk@17/bin/java",
+        "/usr/local/opt/openjdk/bin/java",
+    ]
+    for candidate in brew_candidates:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK) and _is_usable(candidate):
+            return candidate
+
+    # 4) macOS java_home lookup
+    if os.name == "posix":
+        java_home_cmd = "/usr/libexec/java_home"
+        if os.path.exists(java_home_cmd):
+            try:
+                resolved_home = subprocess.check_output([java_home_cmd], stderr=subprocess.STDOUT).decode().strip()
+                java_bin = os.path.join(resolved_home, "bin", "java")
+                if os.path.isfile(java_bin) and os.access(java_bin, os.X_OK) and _is_usable(java_bin):
+                    return java_bin
+            except Exception:
+                pass
+
+    raise RuntimeError(
+        "Java runtime not found or unusable. The system `java` command is likely a macOS placeholder. "
+        "Please install JDK 17+ and set JAVA_HOME if needed. "
+        "macOS example: `brew install --cask temurin`"
+    )
+
+
+def normalize_java_env() -> str:
+    """Ensure JAVA_HOME/PATH point to a usable Java runtime."""
+    java_cmd = find_java_cmd()
+    java_home = java_home_from_cmd(java_cmd)
+    if java_home:
+        os.environ["JAVA_HOME"] = java_home
+
+    java_bin_dir = str(Path(java_cmd).resolve().parent)
+    path_entries = [entry for entry in os.environ.get("PATH", "").split(os.pathsep) if entry]
+    path_entries = [entry for entry in path_entries if entry != java_bin_dir]
+    path_entries.insert(0, java_bin_dir)
+    os.environ["PATH"] = os.pathsep.join(path_entries)
+    return java_cmd
+
+
+def find_keytool_cmd() -> str:
+    """Find a usable keytool executable."""
+
+    def _is_usable(keytool_path: str) -> bool:
+        try:
+            result = subprocess.run(
+                [keytool_path, "-help"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    java_home = os.environ.get("JAVA_HOME")
+    if java_home:
+        keytool_bin = os.path.join(java_home, "bin", "keytool")
+        if os.path.isfile(keytool_bin) and os.access(keytool_bin, os.X_OK) and _is_usable(keytool_bin):
+            return keytool_bin
+
+    keytool_in_path = shutil.which("keytool")
+    if keytool_in_path and _is_usable(keytool_in_path):
+        return keytool_in_path
+
+    java_cmd = find_java_cmd()
+    sibling_keytool = str((Path(java_cmd).resolve().parent / "keytool"))
+    if os.path.isfile(sibling_keytool) and os.access(sibling_keytool, os.X_OK) and _is_usable(sibling_keytool):
+        return sibling_keytool
+
+    brew_candidates = [
+        "/opt/homebrew/opt/openjdk@21/bin/keytool",
+        "/opt/homebrew/opt/openjdk@17/bin/keytool",
+        "/opt/homebrew/opt/openjdk/bin/keytool",
+        "/usr/local/opt/openjdk@21/bin/keytool",
+        "/usr/local/opt/openjdk@17/bin/keytool",
+        "/usr/local/opt/openjdk/bin/keytool",
+    ]
+    for candidate in brew_candidates:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK) and _is_usable(candidate):
+            return candidate
+
+    raise RuntimeError(
+        "keytool not found or unusable. Please install JDK 17+ and ensure keytool is available."
+    )
+
+
 def find_bundletool() -> str:
-    """Find bundletool.jar or download it"""
-    bundletool_jar = os.path.expanduser('~/bundletool.jar')
-    if os.path.exists(bundletool_jar):
-        return bundletool_jar
-    
-    # Download if not found
-    print("Downloading bundletool...")
-    url = 'https://github.com/google/bundletool/releases/download/1.17.2/bundletool-all-1.17.2.jar'
-    urllib.request.urlretrieve(url, bundletool_jar)
-    return bundletool_jar
+    """Find bundletool jar from managed toolchain, downloading if needed."""
+    toolchain_dir = get_toolchain_dir()
+    bundletool_jar = os.path.join(toolchain_dir, f"bundletool-{BUNDLETOOL_VERSION}.jar")
+    return ensure_downloaded_file(resolve_download_urls(BUNDLETOOL_JAR_URL, "CRABSHELL_BUNDLETOOL_URLS"), bundletool_jar)
+
+
+def find_uber_apk_signer() -> str:
+    """Find uber-apk-signer jar from managed toolchain, downloading if needed."""
+    toolchain_dir = get_toolchain_dir()
+    signer_jar = os.path.join(toolchain_dir, f"uber-apk-signer-{UBER_APK_SIGNER_VERSION}.jar")
+    return ensure_downloaded_file(resolve_download_urls(UBER_APK_SIGNER_JAR_URL, "CRABSHELL_UBER_APK_SIGNER_URLS"), signer_jar)
 
 
 def convert_aab_to_apk(aab_path: str, output_apk: str, temp_dir: str) -> str:
     """Convert AAB to universal APK using bundletool"""
     bundletool = find_bundletool()
+    java_cmd = find_java_cmd()
+
+    # bundletool build-apks requires signing config in most environments.
+    # We use debug signing to generate a universal APK for internal processing.
+    debug_keystore, debug_password, debug_alias = get_default_debug_signing()
     
     # Build universal APKs (unsigned for now)
     apks_path = os.path.join(temp_dir, 'temp.apks')
     cmd = [
-        'java', '-jar', bundletool,
+        java_cmd, '-jar', bundletool,
         'build-apks',
         '--bundle', aab_path,
         '--output', apks_path,
-        '--mode', 'universal'
+        '--mode', 'universal',
+        '--ks', debug_keystore,
+        '--ks-pass', f'pass:{debug_password}',
+        '--ks-key-alias', debug_alias,
+        '--key-pass', f'pass:{debug_password}'
     ]
-    subprocess.check_call(cmd)
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        combined_output = "\n".join(part for part in [result.stdout, result.stderr] if part).strip()
+        raise RuntimeError(
+            "bundletool build-apks failed. "
+            f"command={cmd}. output={combined_output or 'No output'}"
+        )
     
     # Extract universal APK from .apks
     with zipfile.ZipFile(apks_path, 'r') as z:
+        if 'universal.apk' not in z.namelist():
+            raise RuntimeError(
+                "bundletool output does not contain universal.apk. "
+                f"entries={z.namelist()[:20]}"
+            )
         z.extract('universal.apk', temp_dir)
     
     universal_apk = os.path.join(temp_dir, 'universal.apk')
@@ -181,6 +527,11 @@ def generate_config(config_path: str, key_bytes: bytes, payload_hash: bytes = No
         obs_str = ", ".join([f"0x{b:02x}" for b in obfuscated])
         strings_content += f"pub const {name}: &[u8] = &[{obs_str}];\n"
 
+    payload_hash_bytes = payload_hash if payload_hash is not None else bytes(32)
+    signature_hash_bytes = signature_hash if signature_hash is not None else bytes(32)
+    payload_hash_str = ", ".join([f"0x{b:02x}" for b in payload_hash_bytes])
+    signature_hash_str = ", ".join([f"0x{b:02x}" for b in signature_hash_bytes])
+
     config_content = f"""
 // Auto-generated by pack.py. DO NOT EDIT.
 
@@ -202,8 +553,8 @@ pub fn get_aes_key() -> [u8; 32] {{
     key
 }}
 
-pub const PAYLOAD_HASH: [u8; 32] = [{", ".join([f"0x{b:02x}" for b in (payload_hash or b'\x00'*32)])}];
-pub const EXPECTED_SIGNATURE_HASH: [u8; 32] = [{", ".join([f"0x{b:02x}" for b in (signature_hash or b'\x00'*32)])}];
+pub const PAYLOAD_HASH: [u8; 32] = [{payload_hash_str}];
+pub const EXPECTED_SIGNATURE_HASH: [u8; 32] = [{signature_hash_str}];
 """
     output_dir = os.path.dirname(config_path)
     os.makedirs(output_dir, exist_ok=True)
@@ -244,6 +595,17 @@ def ensure_tool_exists(tool: str):
         raise RuntimeError(f"Required tool not found: {tool}")
 
 
+def java_home_from_cmd(java_cmd: str) -> Optional[str]:
+    """Derive JAVA_HOME from java executable path."""
+    java_path = Path(java_cmd).resolve()
+    # .../Contents/Home/bin/java -> .../Contents/Home
+    if java_path.parent.name == "bin":
+        candidate = java_path.parent.parent
+        if (candidate / "bin" / "java").exists():
+            return str(candidate)
+    return None
+
+
 def sdk_roots() -> list[str]:
     roots = [
         os.environ.get("ANDROID_SDK_ROOT"),
@@ -259,6 +621,15 @@ def sdk_roots() -> list[str]:
 
 
 def find_android_build_tool(tool_name: str) -> Optional[str]:
+    toolchain_dir = get_toolchain_dir()
+    managed_candidates = [
+        os.path.join(toolchain_dir, "bin", tool_name),
+        os.path.join(toolchain_dir, tool_name),
+    ]
+    for candidate in managed_candidates:
+        if is_executable_file(candidate):
+            return candidate
+
     in_path = shutil.which(tool_name)
     if in_path:
         return in_path
@@ -283,26 +654,23 @@ def find_android_build_tool(tool_name: str) -> Optional[str]:
 
 
 def ensure_apktool_cmd() -> list[str]:
+    toolchain_dir = get_toolchain_dir()
+
+    bundled_candidates = [
+        os.path.join(toolchain_dir, "bin", "apktool"),
+        os.path.join(toolchain_dir, "apktool"),
+    ]
+    for candidate in bundled_candidates:
+        if is_executable_file(candidate):
+            return [candidate]
+
     apktool = shutil.which("apktool")
     if apktool:
         return [apktool]
 
-    java = shutil.which("java")
-    if not java:
-        raise RuntimeError("apktool not found and java not available for apktool jar fallback")
-
-    codex_home = os.environ.get("CODEX_HOME", os.path.expanduser("~/.codex"))
-    tools_dir = os.path.join(codex_home, "tools")
-    os.makedirs(tools_dir, exist_ok=True)
-    apktool_jar = os.path.join(tools_dir, f"apktool-{APKTOOL_VERSION}.jar")
-
-    if not os.path.exists(apktool_jar):
-        print(f"apktool not found, downloading apktool jar {APKTOOL_VERSION}...")
-        try:
-            urllib.request.urlretrieve(APKTOOL_JAR_URL, apktool_jar)
-        except Exception as error:
-            raise RuntimeError(f"Failed to download apktool from {APKTOOL_JAR_URL}: {error}")
-
+    java = find_java_cmd()
+    apktool_jar = os.path.join(toolchain_dir, f"apktool-{APKTOOL_VERSION}.jar")
+    ensure_downloaded_file(resolve_download_urls(APKTOOL_JAR_URL, "CRABSHELL_APKTOOL_URLS"), apktool_jar)
     return [java, "-jar", apktool_jar]
 
 
@@ -337,6 +705,17 @@ def patch_shell_loader_constants(original_app: str, original_factory: str):
 def build_shell():
     print("Building Shell (Native)...")
     env = os.environ.copy()
+
+    java_cmd = find_java_cmd()
+    detected_java_home = java_home_from_cmd(java_cmd)
+    if detected_java_home:
+        env["JAVA_HOME"] = detected_java_home
+
+    java_bin_dir = str(Path(java_cmd).resolve().parent)
+    path_entries = [entry for entry in env.get("PATH", "").split(os.pathsep) if entry]
+    path_entries = [entry for entry in path_entries if entry != java_bin_dir]
+    path_entries.insert(0, java_bin_dir)
+    env["PATH"] = os.pathsep.join(path_entries)
     
     cargo_bin = os.path.expanduser("~/.cargo/bin")
     if cargo_bin not in env.get("PATH", ""):
@@ -392,7 +771,23 @@ def build_shell():
 
     print("Building Shell (APK)...")
     gradlew = "./gradlew" if os.path.exists(os.path.join(SHELL_PROJECT_DIR, "gradlew")) else "gradle"
-    subprocess.check_call([gradlew, "assembleRelease"], cwd=SHELL_PROJECT_DIR, env=env)
+    gradle_result = subprocess.run(
+        [gradlew, "assembleRelease"],
+        cwd=SHELL_PROJECT_DIR,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    if gradle_result.returncode != 0:
+        stdout_tail = "\n".join(gradle_result.stdout.splitlines()[-120:])
+        stderr_tail = "\n".join(gradle_result.stderr.splitlines()[-120:])
+        raise RuntimeError(
+            "Gradle assembleRelease failed. "
+            f"JAVA_HOME={env.get('JAVA_HOME', '<unset>')} "
+            f"gradlew={gradlew}\n"
+            f"--- stdout (tail) ---\n{stdout_tail}\n"
+            f"--- stderr (tail) ---\n{stderr_tail}"
+        )
 
     print("Building Packer...")
     subprocess.check_call(["cargo", "build", "--release"], cwd=PACKER_DIR, env=env)
@@ -471,13 +866,33 @@ def decode_and_patch_target_manifest(target_apk: str, temp_dir: str) -> Tuple[st
     decoded_dir = os.path.join(temp_dir, "target_decoded")
     patched_manifest = os.path.join(temp_dir, "AndroidManifest_patched.xml")
 
+    def run_apktool(command: list[str], action: str) -> None:
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode == 0:
+            return
+        stdout_tail = "\n".join(result.stdout.splitlines()[-120:])
+        stderr_tail = "\n".join(result.stderr.splitlines()[-120:])
+        raise RuntimeError(
+            f"apktool {action} failed. command={command}\n"
+            f"--- stdout (tail) ---\n{stdout_tail}\n"
+            f"--- stderr (tail) ---\n{stderr_tail}"
+        )
+
     print("Decoding target APK with apktool...")
-    subprocess.check_call(apktool_cmd + ["d", "-f", target_apk, "-o", decoded_dir])
+    decode_cmd = apktool_cmd + ["d", "-f", target_apk, "-o", decoded_dir]
+    decoded_with_no_res = False
+    try:
+        run_apktool(decode_cmd, "decode")
+    except RuntimeError as decode_error:
+        print(f"Warning: apktool full decode failed, retrying with -r (no resources). reason={decode_error}")
+        decode_cmd_no_res = apktool_cmd + ["d", "-f", "-r", target_apk, "-o", decoded_dir]
+        run_apktool(decode_cmd_no_res, "decode (-r)")
+        decoded_with_no_res = True
 
     print("Patching decoded AndroidManifest.xml...")
     manifest_path = os.path.join(decoded_dir, "AndroidManifest.xml")
     res_dir = os.path.join(decoded_dir, "res")
-    
+
     provider_class = "com.kapp.shell.BootstrapProvider"
     shell_factory_class = "com.kapp.shell.ShellComponentFactory"
     meta_key = "kapp.original_application"
@@ -499,16 +914,13 @@ def decode_and_patch_target_manifest(target_apk: str, temp_dir: str) -> Tuple[st
 
     original_app = application.attrib.get(ANDROID_NAME, "")
     print(f"Original application: '{original_app}'")
-    
-    # Replace the application class with our shell
+
     application.set(ANDROID_NAME, "com.kapp.shell.ShellApplication")
-    
-    # Strip debuggable flag to ensure ptrace works and app is hardened
+
     if f"{{{ANDROID_NS}}}debuggable" in application.attrib:
         print("Stripping android:debuggable attribute...")
         del application.attrib[f"{{{ANDROID_NS}}}debuggable"]
 
-    # Inject original app metadata
     original_app_meta = None
     original_factory_meta = None
     for child in application.findall("meta-data"):
@@ -531,7 +943,7 @@ def decode_and_patch_target_manifest(target_apk: str, temp_dir: str) -> Tuple[st
 
     ensure_bootstrap_provider(application, provider_class)
 
-    if res_dir and os.path.exists(res_dir):
+    if not decoded_with_no_res and res_dir and os.path.exists(res_dir):
         strings = load_string_resources(res_dir)
         inline_manifest_meta_data_string_values(application, strings)
 
@@ -539,9 +951,9 @@ def decode_and_patch_target_manifest(target_apk: str, temp_dir: str) -> Tuple[st
 
     print("Rebuilding decoded APK with apktool to get patched binary AndroidManifest.xml...")
     manifest_built_apk = os.path.join(temp_dir, "manifest-only.apk")
-    subprocess.check_call(apktool_cmd + ["b", decoded_dir, "-o", manifest_built_apk])
+    build_cmd = apktool_cmd + ["b", decoded_dir, "-o", manifest_built_apk]
+    run_apktool(build_cmd, "build")
 
-    # Extract compiled binary AndroidManifest.xml from rebuilt minimal APK
     import zipfile
 
     resources_arsc = os.path.join(temp_dir, "resources.arsc")
@@ -549,7 +961,7 @@ def decode_and_patch_target_manifest(target_apk: str, temp_dir: str) -> Tuple[st
     with zipfile.ZipFile(manifest_built_apk, "r") as zf:
         with zf.open("AndroidManifest.xml") as mf, open(patched_manifest, "wb") as out:
             out.write(mf.read())
-        
+
         try:
             with zf.open("resources.arsc") as rsc, open(resources_arsc, "wb") as out:
                 out.write(rsc.read())
@@ -557,10 +969,6 @@ def decode_and_patch_target_manifest(target_apk: str, temp_dir: str) -> Tuple[st
             print("Warning: resources.arsc not found in rebuilt APK.")
             resources_arsc = None
 
-    # We do NOT want to use the rebuilt resources.arsc because it might have a different
-    # string pool than the valid binary XML files we are copying from the original APK.
-    # Mixing rebuilt ARSC with original binary XMLs causes Resources$NotFoundException.
-    # So we return None for resources_arsc to force packer to use the original one.
     return patched_manifest, None, original_app, original_factory
 
 
@@ -720,59 +1128,181 @@ def sign_apk(apk_path, keystore, ks_pass, key_alias):
         ks_pass = ks_pass[len("pass:"):]
 
     apksigner = find_android_build_tool("apksigner")
-    if not apksigner:
-        raise RuntimeError("apksigner not found in PATH or Android SDK build-tools")
+    if apksigner:
+        cmd = [
+            apksigner,
+            "sign",
+            "--ks",
+            keystore,
+            "--ks-pass",
+            f"pass:{ks_pass}",
+            "--key-pass",
+            f"pass:{ks_pass}",
+        ]
+        if key_alias:
+            cmd.extend(["--ks-key-alias", key_alias])
+        cmd.append(apk_path)
 
-    cmd = [
-        apksigner,
-        "sign",
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            return
+
+        combined_output = "\n".join(part for part in [result.stdout, result.stderr] if part).strip()
+        print(
+            "Warning: apksigner failed, falling back to managed uber-apk-signer. "
+            f"reason={combined_output or 'No output'}"
+        )
+
+    java_cmd = find_java_cmd()
+    signer_jar = find_uber_apk_signer()
+
+    fallback_cmd = [
+        java_cmd,
+        "-jar",
+        signer_jar,
+        "--apks",
+        apk_path,
         "--ks",
         keystore,
-        "--ks-pass",
-        f"pass:{ks_pass}",
+        "--ksPass",
+        ks_pass,
+        "--ksAlias",
+        key_alias or "androiddebugkey",
+        "--ksKeyPass",
+        ks_pass,
+        "--overwrite",
     ]
-    if key_alias:
-        cmd.extend(["--ks-key-alias", key_alias])
-    cmd.append(apk_path)
-
-    subprocess.check_call(cmd)
+    result = subprocess.run(fallback_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        combined_output = "\n".join(part for part in [result.stdout, result.stderr] if part).strip()
+        raise RuntimeError(
+            "APK signing failed (apksigner unavailable/failed and uber-apk-signer fallback failed). "
+            f"command={fallback_cmd}. output={combined_output or 'No output'}"
+        )
 
 
 def get_default_debug_signing() -> Tuple[str, str, str]:
-    debug_keystore = os.path.expanduser("~/.android/debug.keystore")
     debug_alias = "androiddebugkey"
     debug_password = "android"
+    keytool_cmd = find_keytool_cmd()
 
-    if not os.path.exists(debug_keystore):
-        ensure_tool_exists("keytool")
-        os.makedirs(os.path.dirname(debug_keystore), exist_ok=True)
-        print(f"Debug keystore not found, generating: {debug_keystore}")
-        subprocess.check_call(
-            [
-                "keytool",
-                "-genkeypair",
-                "-v",
-                "-keystore",
-                debug_keystore,
-                "-storepass",
-                debug_password,
-                "-alias",
-                debug_alias,
-                "-keypass",
-                debug_password,
-                "-dname",
-                "CN=Android Debug,O=Android,C=US",
-                "-keyalg",
-                "RSA",
-                "-keysize",
-                "2048",
-                "-validity",
-                "10000",
-            ]
+    home_debug_keystore = os.path.expanduser("~/.android/debug.keystore")
+    temp_debug_keystore = os.path.join(tempfile.gettempdir(), "kapp-debug.keystore")
+
+    def can_write_dir(directory: str) -> bool:
+        try:
+            os.makedirs(directory, exist_ok=True)
+            probe = os.path.join(directory, f".kapp-write-test-{os.getpid()}")
+            with open(probe, "w", encoding="utf-8") as f:
+                f.write("ok")
+            os.remove(probe)
+            return True
+        except Exception:
+            return False
+
+    debug_keystore = home_debug_keystore
+    if not can_write_dir(os.path.dirname(home_debug_keystore)):
+        debug_keystore = temp_debug_keystore
+        print(
+            "Default ~/.android directory is not writable in current runtime. "
+            f"Using temporary debug keystore: {debug_keystore}"
         )
 
-    return debug_keystore, debug_password, debug_alias
+    os.makedirs(os.path.dirname(debug_keystore), exist_ok=True)
 
+    def generate_debug_keystore(target_path: str) -> None:
+        if os.path.exists(target_path):
+            try:
+                os.remove(target_path)
+            except Exception:
+                pass
+
+        print(f"Generating debug keystore: {target_path}")
+        cmd = [
+            keytool_cmd,
+            "-genkeypair",
+            "-v",
+            "-noprompt",
+            "-keystore",
+            target_path,
+            "-storepass",
+            debug_password,
+            "-alias",
+            debug_alias,
+            "-keypass",
+            debug_password,
+            "-dname",
+            "CN=Android Debug,O=Android,C=US",
+            "-keyalg",
+            "RSA",
+            "-keysize",
+            "2048",
+            "-validity",
+            "10000",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            combined_output = "\n".join(part for part in [result.stdout, result.stderr] if part).strip()
+            raise RuntimeError(
+                "keytool generate debug keystore failed. "
+                f"command={cmd}. output={combined_output or 'No output'}"
+            )
+
+    def verify_debug_keystore(target_path: str) -> bool:
+        verify_cmd = [
+            keytool_cmd,
+            "-list",
+            "-keystore",
+            target_path,
+            "-storepass",
+            debug_password,
+            "-alias",
+            debug_alias,
+        ]
+        verify = subprocess.run(verify_cmd, capture_output=True, text=True)
+        return verify.returncode == 0
+
+    def ensure_keystore(target_path: str) -> str:
+        if not os.path.exists(target_path):
+            generate_debug_keystore(target_path)
+            return target_path
+
+        if not verify_debug_keystore(target_path):
+            broken_path = f"{target_path}.broken"
+            print(
+                "Existing debug keystore is invalid for default credentials. "
+                f"Backing up to: {broken_path}"
+            )
+            try:
+                if os.path.exists(broken_path):
+                    os.remove(broken_path)
+                os.rename(target_path, broken_path)
+            except Exception as rename_error:
+                print(f"Warning: failed to back up invalid debug keystore: {rename_error}")
+                try:
+                    os.remove(target_path)
+                except Exception:
+                    pass
+
+            generate_debug_keystore(target_path)
+
+        return target_path
+
+    try:
+        debug_keystore = ensure_keystore(debug_keystore)
+    except RuntimeError as e:
+        if debug_keystore != temp_debug_keystore:
+            print(
+                "Failed to prepare ~/.android debug keystore, retrying with temporary location. "
+                f"Reason: {e}"
+            )
+            debug_keystore = temp_debug_keystore
+            os.makedirs(os.path.dirname(debug_keystore), exist_ok=True)
+            debug_keystore = ensure_keystore(debug_keystore)
+        else:
+            raise
+
+    return debug_keystore, debug_password, debug_alias
 
 def resolve_signing(
     keystore: Optional[str], ks_pass: Optional[str], key_alias: Optional[str]
@@ -809,6 +1339,8 @@ def main():
                        help="Output format (auto=same as input, apk=force APK, aab=force AAB)")
 
     args = parser.parse_args()
+
+    normalize_java_env()
 
     config = load_config(args.config)
 
@@ -899,19 +1431,39 @@ def main():
             encrypt_assets = [encrypt_assets]
 
         signing_keystore, signing_ks_pass, signing_alias = resolve_signing(keystore, ks_pass, key_alias)
-        
-        pack_apk(target, output, bootstrap_apk, patched_manifest, keep_classes, keep_prefixes, keep_libs, encrypt_assets, 
-                 (signing_keystore, signing_ks_pass, signing_alias), key_bytes, resources_arsc)
+
+        # apksigner only supports APK. For AAB output, keep an intermediate APK and
+        # convert it to AAB afterwards.
+        apk_output_path = output
+        if output_format == 'aab':
+            apk_output_path = os.path.join(temp_dir, "hardened_for_aab.apk")
+
+        pack_apk(
+            target,
+            apk_output_path,
+            bootstrap_apk,
+            patched_manifest,
+            keep_classes,
+            keep_prefixes,
+            keep_libs,
+            encrypt_assets,
+            (signing_keystore, signing_ks_pass, signing_alias),
+            key_bytes,
+            resources_arsc,
+        )
 
         if no_sign:
-            print("Skipping signing (--no-sign). Output APK may fail to install.")
+            if output_format == 'aab':
+                print("Skipping signing (--no-sign). Intermediate APK may be unsigned before AAB conversion.")
+            else:
+                print("Skipping signing (--no-sign). Output APK may fail to install.")
         else:
-            sign_apk(output, signing_keystore, signing_ks_pass, signing_alias)
+            sign_apk(apk_output_path, signing_keystore, signing_ks_pass, signing_alias)
         
         # Convert back to AAB if needed
         if output_format == 'aab' and original_aab_path:
             print("Converting hardened APK back to AAB...")
-            temp_apk = output
+            temp_apk = apk_output_path
             # Output already has correct extension from earlier logic
             if not output.endswith('.aab'):
                 output = output.replace('.apk', '.aab') if output.endswith('.apk') else output + '.aab'

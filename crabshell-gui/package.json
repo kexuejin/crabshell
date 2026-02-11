@@ -1,0 +1,44 @@
+{
+    "name": "crabshell-gui",
+    "version": "1.0.0",
+    "description": "Tauri GUI for CrabShell APK/AAB Hardening Tool",
+    "type": "module",
+    "scripts": {
+        "dev": "tauri dev",
+        "dev:renderer": "vite",
+        "build:renderer": "vite build",
+        "build:app": "tauri build --bundles app",
+        "build:dmg": "bash ./scripts/build-dmg.sh",
+        "build": "npm run build:app && npm run build:dmg",
+        "check": "tsc --noEmit"
+    },
+    "keywords": [
+        "android",
+        "apk",
+        "aab",
+        "hardening",
+        "security"
+    ],
+    "author": "CrabShell Team",
+    "license": "MIT",
+    "dependencies": {
+        "@tauri-apps/api": "^2.2.0",
+        "@emotion/react": "^11.11.3",
+        "@emotion/styled": "^11.11.0",
+        "@mui/icons-material": "^5.15.10",
+        "@mui/material": "^5.15.10",
+        "i18next": "^25.8.4",
+        "react": "^18.2.0",
+        "react-dom": "^18.2.0",
+        "react-i18next": "^16.5.4"
+    },
+    "devDependencies": {
+        "@tauri-apps/cli": "^2.2.5",
+        "@types/node": "^20.11.16",
+        "@types/react": "^18.2.52",
+        "@types/react-dom": "^18.2.18",
+        "@vitejs/plugin-react": "^4.2.1",
+        "typescript": "^5.3.3",
+        "vite": "^5.0.12"
+    }
+}

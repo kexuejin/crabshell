@@ -20,6 +20,8 @@ captures/
 *.dex
 *.idsig
 *.so
+*.aab
+*.apks
 .DS_Store
 
 # Generated source
