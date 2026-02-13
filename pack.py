@@ -90,6 +90,11 @@ def format_bytes(size: int) -> str:
     return f"{int(size)}B"
 
 
+def emit_progress(stage: str, percent: int, message: str) -> None:
+    bounded = max(0, min(100, int(percent)))
+    print(f"[progress]|{stage}|{bounded}|{message}")
+
+
 def resolve_download_urls(primary_url: str, env_var: str) -> list[str]:
     raw = os.environ.get(env_var, "").strip()
     urls: list[str] = []
@@ -1161,6 +1166,7 @@ def decode_and_patch_target_manifest(target_apk: str, temp_dir: str) -> Tuple[st
                 except OSError:
                     pass
                 print(f"[manifest-cache] hit key={os.path.basename(cache_dir)}")
+                emit_progress("init.manifest.cache-hit", 18, "Manifest cache hit")
                 maybe_prune_manifest_cache(cache_dir)
                 return patched_manifest, resources_arsc, original_app, original_factory
             except Exception as cache_error:
@@ -1284,6 +1290,7 @@ def decode_and_patch_target_manifest(target_apk: str, temp_dir: str) -> Tuple[st
             elif os.path.exists(cache_resources):
                 os.remove(cache_resources)
             print(f"[manifest-cache] stored key={os.path.basename(cache_dir)}")
+            emit_progress("init.manifest.cache-store", 20, "Manifest cache updated")
         except Exception as cache_error:
             print(f"[manifest-cache] cache store failed, continue without cache. reason={cache_error}")
         maybe_prune_manifest_cache(cache_dir)
@@ -1757,9 +1764,12 @@ def main():
     parser = build_arg_parser()
     args = parser.parse_args()
 
+    emit_progress("init.env.runtime", 2, "Preparing runtime environment")
     normalize_java_env()
+    emit_progress("init.env.java", 5, "Java runtime ready")
 
     config = load_config(args.config)
+    emit_progress("init.config.load", 7, "Configuration loaded")
 
     target = args.target or config.get("target")
     output = args.output if args.output != "protected.apk" else config.get("output", "protected.apk")
@@ -1774,6 +1784,7 @@ def main():
         return
 
     output = normalize_output_path(target, output)
+    emit_progress("init.paths.resolve", 9, "Input and output paths resolved")
 
     output_parent = os.path.dirname(output)
     if output_parent:
@@ -1784,12 +1795,14 @@ def main():
     # Initial config generation for packer build
     generate_config(os.path.join(RUST_SHELL_DIR, "src", "config.rs"), key_bytes)
     generate_config(packer_config_path, key_bytes)
+    emit_progress("init.keys.prepare", 12, "Runtime keys and config prepared")
 
     is_aab_input, output_format, output = resolve_output_format_and_extension(
         target, output, args.output_format
     )
 
     with tempfile.TemporaryDirectory(prefix="kapp-") as temp_dir:
+        emit_progress("init.manifest.prepare", 14, "Preparing manifest patch configuration")
         decoded_dir = os.path.join(temp_dir, "target_decoded")
         (
             target,
@@ -1799,15 +1812,22 @@ def main():
             original_app,
             original_factory,
         ) = prepare_target_manifest(target, is_aab_input, temp_dir)
+        emit_progress("init.manifest.done", 22, "Manifest preparation completed")
 
         maybe_build_toolchain(skip_build, original_app, original_factory)
+        if skip_build:
+            emit_progress("init.toolchain.reuse", 24, "Using existing build artifacts")
+        else:
+            emit_progress("init.toolchain.build", 24, "Toolchain build requested")
 
         bootstrap_apk = get_shell_apk_path(require_exists=False)
         keep_classes, keep_prefixes, keep_libs, encrypt_assets = collect_runtime_lists(
             args, config, decoded_dir
         )
+        emit_progress("init.rules.resolve", 27, "Runtime include/exclude rules resolved")
 
         signing_keystore, signing_ks_pass, signing_alias = resolve_signing(keystore, ks_pass, key_alias)
+        emit_progress("init.signing.resolve", 30, "Signing configuration resolved")
 
         # apksigner only supports APK. For AAB output, keep an intermediate APK and
         # convert it to AAB afterwards.

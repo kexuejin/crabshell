@@ -42,6 +42,8 @@ struct SigningConfig {
 #[serde(rename_all = "camelCase")]
 struct HardeningProgress {
     stage: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    substage: Option<String>,
     progress: u8,
     message: String,
 }
@@ -253,6 +255,7 @@ fn start_hardening(
                                 "hardening-progress",
                                 HardeningProgress {
                                     stage: "done".to_string(),
+                                    substage: None,
                                     progress: 100,
                                     message: "Done! Protected file created.".to_string(),
                                 },
@@ -267,6 +270,7 @@ fn start_hardening(
                                 "hardening-progress",
                                 HardeningProgress {
                                     stage: "error".to_string(),
+                                    substage: None,
                                     progress: 0,
                                     message: format!(
                                         "Error: Process exited with code {:?}. {}",
@@ -285,6 +289,7 @@ fn start_hardening(
                             "hardening-progress",
                             HardeningProgress {
                                 stage: "error".to_string(),
+                                substage: None,
                                 progress: 0,
                                 message: format!("Error checking process status: {error}"),
                             },
@@ -533,7 +538,55 @@ fn emit_log(app: &AppHandle, level: &str, message: &str) {
     );
 }
 
+fn split_stage(stage_raw: &str) -> Option<(String, Option<String>)> {
+    let normalized = stage_raw.trim();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let mut segments = normalized.split('.');
+    let stage = segments.next()?.trim();
+    if stage.is_empty() {
+        return None;
+    }
+
+    let substage = segments
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<&str>>()
+        .join(".");
+
+    let substage = if substage.is_empty() {
+        None
+    } else {
+        Some(substage)
+    };
+
+    Some((stage.to_string(), substage))
+}
+
 fn parse_progress(output: &str) -> Option<HardeningProgress> {
+    if let Some(rest) = output.strip_prefix("[progress]|") {
+        let mut parts = rest.splitn(3, '|');
+        let stage_raw = parts.next().unwrap_or("").trim();
+        let progress_raw = parts.next().unwrap_or("").trim();
+        let message = parts.next().unwrap_or("").trim();
+
+        if message.is_empty() {
+            return None;
+        }
+
+        if let Ok(progress) = progress_raw.parse::<u8>() {
+            let (stage, substage) = split_stage(stage_raw)?;
+            return Some(HardeningProgress {
+                stage,
+                substage,
+                progress: progress.clamp(0, 100),
+                message: message.to_string(),
+            });
+        }
+    }
+
     if output.contains("[toolchain] download-start") {
         let file_name = output
             .split_whitespace()
@@ -541,6 +594,7 @@ fn parse_progress(output: &str) -> Option<HardeningProgress> {
             .unwrap_or("dependency");
         return Some(HardeningProgress {
             stage: "init".to_string(),
+            substage: None,
             progress: 3,
             message: format!("Downloading dependency: {file_name}"),
         });
@@ -560,6 +614,7 @@ fn parse_progress(output: &str) -> Option<HardeningProgress> {
         }
         return Some(HardeningProgress {
             stage: "init".to_string(),
+            substage: None,
             progress,
             message: format!("Downloading {file_name} ({progress}%)"),
         });
@@ -568,6 +623,7 @@ fn parse_progress(output: &str) -> Option<HardeningProgress> {
     if output.contains("[toolchain] download-retry") {
         return Some(HardeningProgress {
             stage: "init".to_string(),
+            substage: None,
             progress: 6,
             message: "Network unstable, retrying dependency download...".to_string(),
         });
@@ -580,6 +636,7 @@ fn parse_progress(output: &str) -> Option<HardeningProgress> {
             .unwrap_or("dependency");
         return Some(HardeningProgress {
             stage: "init".to_string(),
+            substage: None,
             progress: 30,
             message: format!("Dependency ready: {file_name}"),
         });
@@ -607,6 +664,7 @@ fn parse_progress(output: &str) -> Option<HardeningProgress> {
         if output.contains(needle) {
             Some(HardeningProgress {
                 stage: stage.to_string(),
+                substage: None,
                 progress: *progress,
                 message: message.to_string(),
             })
@@ -706,5 +764,25 @@ mod tests {
         assert!(args.contains(&"release".to_string()));
         assert!(!args.contains(&"--ks-pass".to_string()));
         assert!(!args.contains(&"super-secret".to_string()));
+    }
+
+    #[test]
+    fn parse_progress_supports_structured_progress_events() {
+        let line = "[progress]|init.manifest.prepare|14|Preparing manifest patch configuration";
+        let progress = super::parse_progress(line).expect("progress should parse");
+        assert_eq!(progress.stage, "init");
+        assert_eq!(progress.substage.as_deref(), Some("manifest.prepare"));
+        assert_eq!(progress.progress, 14);
+        assert_eq!(progress.message, "Preparing manifest patch configuration");
+    }
+
+    #[test]
+    fn parse_progress_supports_structured_progress_without_substage() {
+        let line = "[progress]|signing|90|Signing package";
+        let progress = super::parse_progress(line).expect("progress should parse");
+        assert_eq!(progress.stage, "signing");
+        assert!(progress.substage.is_none());
+        assert_eq!(progress.progress, 90);
+        assert_eq!(progress.message, "Signing package");
     }
 }

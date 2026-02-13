@@ -62,6 +62,39 @@ const ADVANCED_PRESETS = {
   },
 };
 
+const STAGE_TRANSLATION_KEYS: Record<HardeningProgress['stage'], string> = {
+  init: 'progress.stage.init',
+  building: 'progress.stage.building',
+  packing: 'progress.stage.packing',
+  signing: 'progress.stage.signing',
+  done: 'progress.stage.done',
+  error: 'progress.stage.error',
+};
+
+const SUBSTAGE_TRANSLATION_KEYS: Record<string, string> = {
+  'env.runtime': 'progress.substage.envRuntime',
+  'env.java': 'progress.substage.envJava',
+  'config.load': 'progress.substage.configLoad',
+  'paths.resolve': 'progress.substage.pathsResolve',
+  'keys.prepare': 'progress.substage.keysPrepare',
+  'manifest.prepare': 'progress.substage.manifestPrepare',
+  'manifest.cache-hit': 'progress.substage.manifestCacheHit',
+  'manifest.cache-store': 'progress.substage.manifestCacheStore',
+  'manifest.done': 'progress.substage.manifestDone',
+  'toolchain.reuse': 'progress.substage.toolchainReuse',
+  'toolchain.build': 'progress.substage.toolchainBuild',
+  'rules.resolve': 'progress.substage.rulesResolve',
+  'signing.resolve': 'progress.substage.signingResolve',
+};
+
+const formatSubstageFallback = (substage: string) =>
+  substage
+    .replace(/-/g, ' ')
+    .split('.')
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .join(' > ');
+
 const App: React.FC = () => {
   const { t } = useTranslation();
 
@@ -88,6 +121,7 @@ const App: React.FC = () => {
     message: t('messages.readyToStart'),
   });
   const [isProcessing, setIsProcessing] = useState(false);
+  const [runStartedAt, setRunStartedAt] = useState<number | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(false);
 
   const isIndeterminateProgress =
@@ -106,6 +140,61 @@ const App: React.FC = () => {
 
     return t('app.statusNormal', { progress: progress.progress, message: progress.message });
   }, [isIndeterminateProgress, progress, t]);
+
+  const stageLabel = useMemo(
+    () =>
+      t(STAGE_TRANSLATION_KEYS[progress.stage], {
+        defaultValue: progress.stage,
+      }),
+    [progress.stage, t],
+  );
+
+  const substageLabel = useMemo(() => {
+    if (!progress.substage) {
+      return '';
+    }
+
+    const key = SUBSTAGE_TRANSLATION_KEYS[progress.substage];
+    return t(key ?? 'progress.substage.unknown', {
+      defaultValue: formatSubstageFallback(progress.substage),
+    });
+  }, [progress.substage, t]);
+
+  const stageContextText = useMemo(() => {
+    if (progress.stage === 'error' || progress.stage === 'done') {
+      return '';
+    }
+
+    if (substageLabel) {
+      return t('app.stageWithSubstage', { stage: stageLabel, substage: substageLabel });
+    }
+
+    return t('app.stageOnly', { stage: stageLabel });
+  }, [progress.stage, stageLabel, substageLabel, t]);
+
+  const etaText = useMemo(() => {
+    if (!isProcessing || !runStartedAt || progress.stage !== 'init') {
+      return '';
+    }
+
+    if (progress.progress < 8 || progress.progress >= 100) {
+      return '';
+    }
+
+    const elapsedSeconds = (Date.now() - runStartedAt) / 1000;
+    if (elapsedSeconds <= 0) {
+      return '';
+    }
+
+    const completionRatio = progress.progress / 100;
+    const estimatedTotalSeconds = elapsedSeconds / completionRatio;
+    const remainingSeconds = Math.max(0, Math.round(estimatedTotalSeconds - elapsedSeconds));
+    if (!Number.isFinite(remainingSeconds) || remainingSeconds > 3600) {
+      return '';
+    }
+
+    return t('app.etaSeconds', { seconds: remainingSeconds });
+  }, [isProcessing, progress.progress, progress.stage, runStartedAt, t]);
 
   const parseList = (value: string) =>
     value
@@ -171,8 +260,10 @@ const App: React.FC = () => {
     }
 
     setIsProcessing(true);
+    setRunStartedAt(Date.now());
     setProgress({
       stage: 'init',
+      substage: 'env.runtime',
       progress: 1,
       message: t('messages.initializingEnv'),
     });
@@ -183,16 +274,19 @@ const App: React.FC = () => {
       const message = String(error);
       setProgress({
         stage: 'error',
+        substage: undefined,
         progress: 0,
         message,
       });
       setIsProcessing(false);
+      setRunStartedAt(null);
     }
   };
 
   const handleCancel = async () => {
     await cancelHardening();
     setIsProcessing(false);
+    setRunStartedAt(null);
   };
 
   React.useEffect(() => {
@@ -204,6 +298,7 @@ const App: React.FC = () => {
       setProgress(data);
       if (data.stage === 'done' || data.stage === 'error') {
         setIsProcessing(false);
+        setRunStartedAt(null);
       }
     }).then((cleanup) => {
       unlistenProgress = cleanup;
@@ -447,6 +542,11 @@ const App: React.FC = () => {
           <Typography variant="caption" sx={{ color: '#0F172A', fontWeight: 600, mb: 0.5, display: 'block' }}>
             {statusText}
           </Typography>
+          {stageContextText ? (
+            <Typography variant="caption" sx={{ color: '#334155', mb: 0.5, display: 'block' }}>
+              {etaText ? `${stageContextText} · ${etaText}` : stageContextText}
+            </Typography>
+          ) : null}
           <LinearProgress
             variant={isIndeterminateProgress ? 'indeterminate' : 'determinate'}
             value={isIndeterminateProgress ? undefined : progress.progress}

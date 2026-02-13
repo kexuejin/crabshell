@@ -20,6 +20,7 @@ export interface HardeningConfig {
 
 export interface HardeningProgress {
     stage: 'init' | 'building' | 'packing' | 'signing' | 'done' | 'error';
+    substage?: string;
     progress: number; // 0-100
     message: string;
 }
