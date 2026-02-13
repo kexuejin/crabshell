@@ -40,6 +40,7 @@ jobs:
       - name: Run fast CLI tests
         run: |
           python3 -m unittest \
+            scripts/test_check_hardened_apk.py \
             scripts/test_pack_main_helpers.py \
             scripts/test_pack_skip_build.py \
             scripts/test_pack_build_flow.py \

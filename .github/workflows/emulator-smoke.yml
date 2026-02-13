@@ -7,6 +7,7 @@ on:
     paths:
       - ".github/workflows/emulator-smoke.yml"
       - "scripts/ci_emulator_smoke.sh"
+      - "scripts/check_hardened_apk.py"
       - "fixtures/test-apps/**"
       - "loader/**"
       - "pack.py"

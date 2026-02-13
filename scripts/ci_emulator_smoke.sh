@@ -109,6 +109,14 @@ assert_apk_contains_library "${mmkv_input_apk}" "libmmkv.so"
 python3 pack.py --target "${mmkv_input_apk}" --output "${mmkv_output_apk}"
 [[ -f "${mmkv_output_apk}" ]] || fail "Protected MMKV APK missing: ${mmkv_output_apk}"
 
+log_step "Verify hardened APK layout"
+python3 scripts/check_hardened_apk.py \
+  --apk "${mmkv_output_apk}" \
+  --require-entry "assets/kapp_payload.bin" \
+  --forbid-lib "mmkv" \
+  --min-plaintext-dex 1 \
+  --max-plaintext-dex 1
+
 log_step "Install and launch protected mmkv target"
 adb uninstall com.example.kappb >/dev/null 2>&1 || true
 adb install -r "${mmkv_output_apk}" >/dev/null
