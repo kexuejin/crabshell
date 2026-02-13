@@ -64,6 +64,43 @@ check_logs_for_crash() {
   return 0
 }
 
+wait_for_package_manager() {
+  local retries="${1:-30}"
+  local sleep_seconds="${2:-2}"
+
+  for ((i = 0; i < retries; i++)); do
+    if adb shell cmd package list packages >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep "${sleep_seconds}"
+  done
+
+  return 1
+}
+
+adb_install_with_retry() {
+  local apk_path="$1"
+  local retries="${2:-4}"
+  local sleep_seconds="${3:-3}"
+  local output=""
+
+  for ((attempt = 1; attempt <= retries; attempt++)); do
+    if output="$(adb install -r "${apk_path}" 2>&1)"; then
+      return 0
+    fi
+
+    echo "[WARN] adb install failed (attempt ${attempt}/${retries}): ${output}"
+    if ((attempt < retries)); then
+      adb wait-for-device >/dev/null 2>&1 || true
+      wait_for_package_manager 10 2 || true
+      sleep "${sleep_seconds}"
+    fi
+  done
+
+  echo "[ERROR] adb install failed after ${retries} attempts: ${output}"
+  return 1
+}
+
 assert_apk_contains_library() {
   local apk_path="$1"
   local lib_name="$2"
@@ -118,8 +155,9 @@ python3 scripts/check_hardened_apk.py \
   --max-plaintext-dex 1
 
 log_step "Install and launch protected mmkv target"
+wait_for_package_manager 30 2 || fail "Android package manager is not ready"
 adb uninstall com.example.kappb >/dev/null 2>&1 || true
-adb install -r "${mmkv_output_apk}" >/dev/null
+adb_install_with_retry "${mmkv_output_apk}" 4 3 || fail "Failed to install protected MMKV target APK"
 adb logcat -c
 adb shell monkey -p com.example.kappb -c android.intent.category.LAUNCHER 1 >/dev/null
 
