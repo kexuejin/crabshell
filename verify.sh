@@ -1,6 +1,9 @@
 #!/bin/bash
 set -e
 
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT_DIR"
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 NC='\033[0m'
@@ -155,7 +158,7 @@ if [ $? -ne 0 ]; then
     echo -e "${RED}[FAIL] Cargo NDK build failed.${NC}"
     exit 1
 fi
-cd ../../../..
+cd "$ROOT_DIR"
 
 echo "Building Android Shell (APK)..."
 cd loader

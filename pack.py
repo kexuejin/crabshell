@@ -8,6 +8,7 @@ import secrets
 import shutil
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -38,6 +39,15 @@ ANDROID_VALUE = f"{{{ANDROID_NS}}}value"
 ANDROID_AUTHORITIES = f"{{{ANDROID_NS}}}authorities"
 ANDROID_EXPORTED = f"{{{ANDROID_NS}}}exported"
 ANDROID_INIT_ORDER = f"{{{ANDROID_NS}}}initOrder"
+MANIFEST_CACHE_SUBDIR = "manifest-cache"
+MANIFEST_CACHE_SCHEMA_VERSION = "2"
+DEFAULT_BOOTSTRAP_PROVIDER_CLASS = "com.kapp.shell.BootstrapProvider"
+DEFAULT_SHELL_FACTORY_CLASS = "com.kapp.shell.ShellComponentFactory"
+DEFAULT_SHELL_APPLICATION_CLASS = "com.kapp.shell.ShellApplication"
+DEFAULT_ORIGINAL_APP_META_KEY = "kapp.original_application"
+DEFAULT_ORIGINAL_FACTORY_META_KEY = "kapp.original_factory"
+DEFAULT_MANIFEST_CACHE_MAX_ENTRIES = 40
+DEFAULT_MANIFEST_CACHE_TTL_DAYS = 14
 
 
 
@@ -93,6 +103,12 @@ def resolve_download_urls(primary_url: str, env_var: str) -> list[str]:
         urls.append(primary_url)
 
     return urls
+
+
+def is_truthy_env(value: Optional[str]) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def download_with_url_fallback(urls: Sequence[str], target_path: str, retries: int = TOOL_DOWNLOAD_RETRIES) -> None:
@@ -214,6 +230,161 @@ def ensure_downloaded_file(url_or_urls: Union[str, Sequence[str]], target_path: 
         raise RuntimeError(f"Downloaded file is invalid and could not be validated: {target_path}")
 
     return target_path
+
+
+def get_manifest_cache_dir() -> str:
+    env_dir = os.environ.get("CRABSHELL_MANIFEST_CACHE_DIR")
+    if env_dir:
+        cache_dir = os.path.expanduser(env_dir)
+    else:
+        cache_dir = os.path.join(get_toolchain_dir(), MANIFEST_CACHE_SUBDIR)
+    os.makedirs(cache_dir, exist_ok=True)
+    return cache_dir
+
+
+def get_manifest_patch_config() -> dict[str, str]:
+    return {
+        "provider_class": os.environ.get(
+            "CRABSHELL_BOOTSTRAP_PROVIDER_CLASS", DEFAULT_BOOTSTRAP_PROVIDER_CLASS
+        ),
+        "shell_factory_class": os.environ.get(
+            "CRABSHELL_SHELL_FACTORY_CLASS", DEFAULT_SHELL_FACTORY_CLASS
+        ),
+        "shell_application_class": os.environ.get(
+            "CRABSHELL_SHELL_APPLICATION_CLASS", DEFAULT_SHELL_APPLICATION_CLASS
+        ),
+        "meta_key": os.environ.get(
+            "CRABSHELL_ORIGINAL_APP_META_KEY", DEFAULT_ORIGINAL_APP_META_KEY
+        ),
+        "factory_meta_key": os.environ.get(
+            "CRABSHELL_ORIGINAL_FACTORY_META_KEY", DEFAULT_ORIGINAL_FACTORY_META_KEY
+        ),
+        "cache_salt": os.environ.get("CRABSHELL_MANIFEST_CACHE_SALT", ""),
+    }
+
+
+def compute_manifest_cache_key(target_apk: str, use_rebuilt_resources: bool) -> str:
+    apk_hash = compute_sha256(target_apk)
+    patch_config = get_manifest_patch_config()
+    source = "|".join(
+        [
+            f"schema={MANIFEST_CACHE_SCHEMA_VERSION}",
+            f"apktool={APKTOOL_VERSION}",
+            f"rebuilt_resources={int(use_rebuilt_resources)}",
+            f"apk_hash={apk_hash}",
+            f"provider_class={patch_config['provider_class']}",
+            f"shell_factory_class={patch_config['shell_factory_class']}",
+            f"shell_application_class={patch_config['shell_application_class']}",
+            f"meta_key={patch_config['meta_key']}",
+            f"factory_meta_key={patch_config['factory_meta_key']}",
+            f"cache_salt={patch_config['cache_salt']}",
+        ]
+    )
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def parse_non_negative_int(value: Optional[str], default: int) -> int:
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    if parsed < 0:
+        return default
+    return parsed
+
+
+def get_manifest_cache_cleanup_policy() -> tuple[int, int]:
+    max_entries = parse_non_negative_int(
+        os.environ.get("CRABSHELL_MANIFEST_CACHE_MAX_ENTRIES"),
+        DEFAULT_MANIFEST_CACHE_MAX_ENTRIES,
+    )
+    ttl_days = parse_non_negative_int(
+        os.environ.get("CRABSHELL_MANIFEST_CACHE_TTL_DAYS"),
+        DEFAULT_MANIFEST_CACHE_TTL_DAYS,
+    )
+    ttl_seconds = ttl_days * 24 * 60 * 60
+    return max_entries, ttl_seconds
+
+
+def prune_manifest_cache(
+    cache_root: str,
+    max_entries: int,
+    ttl_seconds: int,
+    now_ts: Optional[float] = None,
+    preserve_paths: Optional[set[str]] = None,
+) -> list[str]:
+    if not os.path.isdir(cache_root):
+        return []
+
+    preserve = {os.path.abspath(path) for path in (preserve_paths or set())}
+    current_ts = time.time() if now_ts is None else now_ts
+
+    entries: list[tuple[str, float]] = []
+    for name in os.listdir(cache_root):
+        path = os.path.join(cache_root, name)
+        if not os.path.isdir(path):
+            continue
+        abs_path = os.path.abspath(path)
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        entries.append((abs_path, mtime))
+
+    removed: list[str] = []
+
+    if ttl_seconds > 0:
+        cutoff = current_ts - ttl_seconds
+        for path, mtime in entries:
+            if path in preserve or mtime >= cutoff:
+                continue
+            try:
+                shutil.rmtree(path)
+                removed.append(path)
+            except OSError:
+                pass
+
+    existing_entries: list[tuple[str, float]] = []
+    for path, mtime in entries:
+        if path in removed:
+            continue
+        if not os.path.isdir(path):
+            continue
+        existing_entries.append((path, mtime))
+
+    if max_entries > 0 and len(existing_entries) > max_entries:
+        existing_entries.sort(key=lambda item: item[1])  # oldest first
+        current_count = len(existing_entries)
+        for path, _ in existing_entries:
+            if current_count <= max_entries:
+                break
+            if path in preserve:
+                continue
+            try:
+                shutil.rmtree(path)
+                removed.append(path)
+                current_count -= 1
+            except OSError:
+                pass
+
+    return removed
+
+
+def maybe_prune_manifest_cache(active_cache_dir: Optional[str]) -> None:
+    if not active_cache_dir:
+        return
+
+    max_entries, ttl_seconds = get_manifest_cache_cleanup_policy()
+    removed = prune_manifest_cache(
+        cache_root=os.path.dirname(active_cache_dir),
+        max_entries=max_entries,
+        ttl_seconds=ttl_seconds,
+        preserve_paths={active_cache_dir},
+    )
+    if removed:
+        print(f"[manifest-cache] pruned {len(removed)} entries")
 
 
 def compute_sha256(file_path: str) -> str:
@@ -435,64 +606,79 @@ def convert_aab_to_apk(aab_path: str, output_apk: str, temp_dir: str) -> str:
 
 def convert_apk_to_aab(apk_path: str, output_aab: str, original_aab: str, temp_dir: str) -> str:
     """Convert hardened APK back to AAB format"""
-    # Extract original AAB structure
-    aab_extract_dir = os.path.join(temp_dir, 'aab_structure')
-    os.makedirs(aab_extract_dir, exist_ok=True)
-    
-    with zipfile.ZipFile(original_aab, 'r') as z:
-        z.extractall(aab_extract_dir)
-    
-    # Extract hardened APK
-    apk_extract_dir = os.path.join(temp_dir, 'hardened_apk')
-    os.makedirs(apk_extract_dir, exist_ok=True)
-    
-    with zipfile.ZipFile(apk_path, 'r') as z:
-        z.extractall(apk_extract_dir)
-    
-    # Replace base module contents with hardened APK contents
-    base_dir = os.path.join(aab_extract_dir, 'base')
-    
-    # Copy hardened DEX files
-    base_dex_dir = os.path.join(base_dir, 'dex')
-    if os.path.exists(base_dex_dir):
-        shutil.rmtree(base_dex_dir)
-    os.makedirs(base_dex_dir, exist_ok=True)
-    
-    for item in os.listdir(apk_extract_dir):
-        if item.endswith('.dex'):
-            src = os.path.join(apk_extract_dir, item)
-            dst = os.path.join(base_dex_dir, item)
-            shutil.copy2(src, dst)
-    
-    # Copy hardened native libraries
-    apk_lib_dir = os.path.join(apk_extract_dir, 'lib')
-    if os.path.exists(apk_lib_dir):
-        base_lib_dir = os.path.join(base_dir, 'lib')
-        if os.path.exists(base_lib_dir):
-            shutil.rmtree(base_lib_dir)
-        shutil.copytree(apk_lib_dir, base_lib_dir)
-    
-    # Copy hardened assets
-    apk_assets_dir = os.path.join(apk_extract_dir, 'assets')
-    if os.path.exists(apk_assets_dir):
-        base_assets_dir = os.path.join(base_dir, 'assets')
-        if os.path.exists(base_assets_dir):
-            shutil.rmtree(base_assets_dir)
-        shutil.copytree(apk_assets_dir, base_assets_dir)
-    
-    # NOTE: We do NOT copy the manifest from the hardened APK
-    # The original AAB manifest is already patched (from the AAB-to-APK conversion)
-    # and is in the correct protobuf format that bundletool expects.
-    # The hardened APK has a binary XML manifest which is incompatible with AAB format.
-    
-    # Rebuild AAB
-    with zipfile.ZipFile(output_aab, 'w', zipfile.ZIP_DEFLATED) as z:
-        for root, dirs, files in os.walk(aab_extract_dir):
-            for file in files:
-                file_path = os.path.join(root, file)
-                arcname = os.path.relpath(file_path, aab_extract_dir)
-                z.write(file_path, arcname)
-    
+    _ = temp_dir
+
+    def clone_zip_info(info: zipfile.ZipInfo) -> zipfile.ZipInfo:
+        cloned = zipfile.ZipInfo(filename=info.filename, date_time=info.date_time)
+        cloned.compress_type = info.compress_type
+        cloned.external_attr = info.external_attr
+        cloned.comment = info.comment
+        cloned.extra = info.extra
+        cloned.create_system = info.create_system
+        cloned.create_version = info.create_version
+        cloned.extract_version = info.extract_version
+        cloned.flag_bits = info.flag_bits
+        cloned.internal_attr = info.internal_attr
+        return cloned
+
+    def read_hardened_payload_entries(
+        apk_zip: zipfile.ZipFile,
+    ) -> tuple[dict[str, bytes], dict[str, bytes], dict[str, bytes]]:
+        dex_entries: dict[str, bytes] = {}
+        lib_entries: dict[str, bytes] = {}
+        asset_entries: dict[str, bytes] = {}
+
+        for info in apk_zip.infolist():
+            name = info.filename
+            if info.is_dir():
+                continue
+
+            if name.endswith(".dex") and "/" not in name:
+                dex_entries[f"base/dex/{name}"] = apk_zip.read(name)
+                continue
+
+            if name.startswith("lib/"):
+                relative = name[len("lib/"):]
+                if relative:
+                    lib_entries[f"base/lib/{relative}"] = apk_zip.read(name)
+                continue
+
+            if name.startswith("assets/"):
+                relative = name[len("assets/"):]
+                if relative:
+                    asset_entries[f"base/assets/{relative}"] = apk_zip.read(name)
+
+        return dex_entries, lib_entries, asset_entries
+
+    with zipfile.ZipFile(apk_path, "r") as apk_zip:
+        dex_entries, lib_entries, asset_entries = read_hardened_payload_entries(apk_zip)
+
+    replace_lib = bool(lib_entries)
+    replace_assets = bool(asset_entries)
+
+    with zipfile.ZipFile(original_aab, "r") as source_zip, zipfile.ZipFile(
+        output_aab, "w", zipfile.ZIP_DEFLATED
+    ) as output_zip:
+        for info in source_zip.infolist():
+            name = info.filename
+            if name.startswith("base/dex/"):
+                continue
+            if replace_lib and name.startswith("base/lib/"):
+                continue
+            if replace_assets and name.startswith("base/assets/"):
+                continue
+
+            copied_info = clone_zip_info(info)
+            payload = b"" if info.is_dir() else source_zip.read(name)
+            output_zip.writestr(copied_info, payload)
+
+        for name in sorted(dex_entries):
+            output_zip.writestr(name, dex_entries[name], compress_type=zipfile.ZIP_DEFLATED)
+        for name in sorted(lib_entries):
+            output_zip.writestr(name, lib_entries[name], compress_type=zipfile.ZIP_DEFLATED)
+        for name in sorted(asset_entries):
+            output_zip.writestr(name, asset_entries[name], compress_type=zipfile.ZIP_DEFLATED)
+
     return output_aab
 
 
@@ -934,10 +1120,12 @@ def ensure_bootstrap_provider(
 
 
 def decode_and_patch_target_manifest(target_apk: str, temp_dir: str) -> Tuple[str, Optional[str], str, str]:
-    apktool_cmd = ensure_apktool_cmd()
+    use_rebuilt_resources = os.environ.get("CRABSHELL_USE_REBUILT_RESOURCES", "0") == "1"
+    manifest_cache_enabled = not is_truthy_env(os.environ.get("CRABSHELL_MANIFEST_CACHE_DISABLE"))
 
     decoded_dir = os.path.join(temp_dir, "target_decoded")
     patched_manifest = os.path.join(temp_dir, "AndroidManifest_patched.xml")
+    cache_dir = None
 
     def run_apktool(command: list[str], action: str) -> None:
         result = subprocess.run(command, capture_output=True, text=True)
@@ -950,6 +1138,35 @@ def decode_and_patch_target_manifest(target_apk: str, temp_dir: str) -> Tuple[st
             f"--- stdout (tail) ---\n{stdout_tail}\n"
             f"--- stderr (tail) ---\n{stderr_tail}"
         )
+
+    if manifest_cache_enabled:
+        cache_dir = os.path.join(get_manifest_cache_dir(), compute_manifest_cache_key(target_apk, use_rebuilt_resources))
+        cached_manifest = os.path.join(cache_dir, "AndroidManifest_patched.xml")
+        cached_meta = os.path.join(cache_dir, "meta.json")
+        cached_resources = os.path.join(cache_dir, "resources.arsc")
+        if os.path.exists(cached_manifest) and os.path.exists(cached_meta):
+            try:
+                with open(cached_meta, "r", encoding="utf-8") as meta_file:
+                    cached = json.load(meta_file)
+                shutil.copy2(cached_manifest, patched_manifest)
+                resources_arsc = None
+                if use_rebuilt_resources and os.path.exists(cached_resources):
+                    resources_arsc = os.path.join(temp_dir, "resources.arsc")
+                    shutil.copy2(cached_resources, resources_arsc)
+
+                original_app = cached.get("original_app", "")
+                original_factory = cached.get("original_factory", "")
+                try:
+                    os.utime(cache_dir, None)
+                except OSError:
+                    pass
+                print(f"[manifest-cache] hit key={os.path.basename(cache_dir)}")
+                maybe_prune_manifest_cache(cache_dir)
+                return patched_manifest, resources_arsc, original_app, original_factory
+            except Exception as cache_error:
+                print(f"[manifest-cache] cache read failed, fallback to apktool. reason={cache_error}")
+
+    apktool_cmd = ensure_apktool_cmd()
 
     print("Decoding target APK with apktool...")
     decode_cmd = apktool_cmd + ["d", "-f", target_apk, "-o", decoded_dir]
@@ -965,11 +1182,12 @@ def decode_and_patch_target_manifest(target_apk: str, temp_dir: str) -> Tuple[st
     print("Patching decoded AndroidManifest.xml...")
     manifest_path = os.path.join(decoded_dir, "AndroidManifest.xml")
     res_dir = os.path.join(decoded_dir, "res")
-
-    provider_class = "com.kapp.shell.BootstrapProvider"
-    shell_factory_class = "com.kapp.shell.ShellComponentFactory"
-    meta_key = "kapp.original_application"
-    factory_meta_key = "kapp.original_factory"
+    patch_config = get_manifest_patch_config()
+    provider_class = patch_config["provider_class"]
+    shell_factory_class = patch_config["shell_factory_class"]
+    shell_application_class = patch_config["shell_application_class"]
+    meta_key = patch_config["meta_key"]
+    factory_meta_key = patch_config["factory_meta_key"]
 
     ET.register_namespace("android", ANDROID_NS)
     tree = ET.parse(manifest_path)
@@ -988,7 +1206,7 @@ def decode_and_patch_target_manifest(target_apk: str, temp_dir: str) -> Tuple[st
     original_app = application.attrib.get(ANDROID_NAME, "")
     print(f"Original application: '{original_app}'")
 
-    application.set(ANDROID_NAME, "com.kapp.shell.ShellApplication")
+    application.set(ANDROID_NAME, shell_application_class)
 
     if f"{{{ANDROID_NS}}}debuggable" in application.attrib:
         print("Stripping android:debuggable attribute...")
@@ -1033,7 +1251,6 @@ def decode_and_patch_target_manifest(target_apk: str, temp_dir: str) -> Tuple[st
     import zipfile
 
     resources_arsc = None
-    use_rebuilt_resources = os.environ.get("CRABSHELL_USE_REBUILT_RESOURCES", "0") == "1"
 
     with zipfile.ZipFile(manifest_built_apk, "r") as zf:
         with zf.open("AndroidManifest.xml") as mf, open(patched_manifest, "wb") as out:
@@ -1049,6 +1266,27 @@ def decode_and_patch_target_manifest(target_apk: str, temp_dir: str) -> Tuple[st
                 print("Warning: resources.arsc not found in rebuilt APK.")
         else:
             print("Preserving original target resources.arsc (skip rebuilt resources replacement).")
+
+    if manifest_cache_enabled and cache_dir:
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            shutil.copy2(patched_manifest, os.path.join(cache_dir, "AndroidManifest_patched.xml"))
+            meta = {
+                "original_app": original_app,
+                "original_factory": original_factory,
+            }
+            with open(os.path.join(cache_dir, "meta.json"), "w", encoding="utf-8") as meta_file:
+                json.dump(meta, meta_file)
+
+            cache_resources = os.path.join(cache_dir, "resources.arsc")
+            if resources_arsc and os.path.exists(resources_arsc):
+                shutil.copy2(resources_arsc, cache_resources)
+            elif os.path.exists(cache_resources):
+                os.remove(cache_resources)
+            print(f"[manifest-cache] stored key={os.path.basename(cache_dir)}")
+        except Exception as cache_error:
+            print(f"[manifest-cache] cache store failed, continue without cache. reason={cache_error}")
+        maybe_prune_manifest_cache(cache_dir)
 
     return patched_manifest, resources_arsc, original_app, original_factory
 
