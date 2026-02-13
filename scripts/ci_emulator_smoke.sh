@@ -106,7 +106,7 @@ mmkv_output_apk="artifacts/ci/kappb-protected.apk"
 [[ -f "${mmkv_input_apk}" ]] || fail "MMKV target APK missing: ${mmkv_input_apk}"
 
 assert_apk_contains_library "${mmkv_input_apk}" "libmmkv.so"
-python3 pack.py --target "${mmkv_input_apk}" --output "${mmkv_output_apk}" --skip-build
+python3 pack.py --target "${mmkv_input_apk}" --output "${mmkv_output_apk}"
 [[ -f "${mmkv_output_apk}" ]] || fail "Protected MMKV APK missing: ${mmkv_output_apk}"
 
 log_step "Install and launch protected mmkv target"
