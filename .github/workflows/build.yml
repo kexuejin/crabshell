@@ -93,13 +93,7 @@ jobs:
           disable-animations: false
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           script: |
-            if [ -z "${ANDROID_NDK_HOME:-}" ] && [ -d "${ANDROID_SDK_ROOT}/ndk" ]; then
-              export ANDROID_NDK_HOME="$(ls -d "${ANDROID_SDK_ROOT}/ndk/"* | sort -V | tail -n 1)"
-            fi
-            echo "Using ANDROID_NDK_HOME=${ANDROID_NDK_HOME:-unset}"
-            cd loader
-            ./gradlew -q dependencies || true
-            ./gradlew :app:connectedDebugAndroidTest --stacktrace
+            bash scripts/ci_emulator_smoke.sh
 
   gui-package:
     name: GUI Package (${{ matrix.platform.name }})
