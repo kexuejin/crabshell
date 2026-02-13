@@ -148,12 +148,18 @@ jobs:
           set -euo pipefail
           TAG="${{ steps.vars.outputs.tag }}"
           mkdir -p release-assets
-          shopt -s nullglob
 
-          for file in release-artifacts/*; do
-            base="$(basename "$file")"
-            cp "$file" "release-assets/CrabShell-${TAG}-${base}"
-          done
+          # download-artifact can contain nested directories; publish files only.
+          while IFS= read -r -d '' file; do
+            rel="${file#release-artifacts/}"
+            safe_rel="${rel//\//-}"
+            cp "$file" "release-assets/CrabShell-${TAG}-${safe_rel}"
+          done < <(find release-artifacts -type f -print0 | sort -z)
+
+          if ! find release-assets -maxdepth 1 -type f | grep -q .; then
+            echo "No release files found under release-artifacts/"
+            exit 1
+          fi
 
           ls -lah release-assets
 

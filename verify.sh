@@ -153,7 +153,7 @@ if [ -z "$ANDROID_NDK_HOME" ]; then
     exit 1
 fi
 
-cargo ndk -t arm64-v8a -t armeabi-v7a -o ../jniLibs build --release
+cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -o ../jniLibs build --release
 if [ $? -ne 0 ]; then
     echo -e "${RED}[FAIL] Cargo NDK build failed.${NC}"
     exit 1

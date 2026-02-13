@@ -78,7 +78,8 @@ tasks.register('cargoBuild', Exec) {
     }
 
     environment 'ANDROID_NDK_HOME', ndkHome
-    commandLine 'cargo', 'ndk', '-t', 'arm64-v8a', '-t', 'armeabi-v7a', '-o', '../jniLibs', 'build', '--release'
+    // Keep x86_64 for emulator/CI startup smoke tests.
+    commandLine 'cargo', 'ndk', '-t', 'arm64-v8a', '-t', 'armeabi-v7a', '-t', 'x86_64', '-o', '../jniLibs', 'build', '--release'
     workingDir 'src/main/rust'
     
     // Keep Android build honest: Rust/NDK failure should fail the build.
