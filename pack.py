@@ -1726,8 +1726,6 @@ def collect_runtime_lists(args, config: dict, decoded_dir: str) -> tuple[list[st
     keep_prefixes = normalize_cli_list(args.keep_prefix or config.get("keep_prefix"))
 
     keep_libs = normalize_cli_list(args.keep_lib or config.get("keep_lib"))
-    if "mmkv" not in keep_libs:
-        keep_libs.append("mmkv")
 
     encrypt_assets = normalize_cli_list(args.encrypt_asset or config.get("encrypt_asset"))
     return keep_classes, keep_prefixes, keep_libs, encrypt_assets

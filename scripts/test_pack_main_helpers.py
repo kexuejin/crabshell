@@ -60,8 +60,25 @@ class PackMainHelpersTests(unittest.TestCase):
             ["com.manifest.Entry", "com.config.KeepClass"],
         )
         self.assertEqual(keep_prefixes, ["com.runtime.keep"])
-        self.assertEqual(keep_libs, ["sqlite", "mmkv"])
+        self.assertEqual(keep_libs, ["sqlite"])
         self.assertEqual(encrypt_assets, ["assets/*.js"])
+
+    def test_collect_runtime_lists_keeps_mmkv_only_when_explicitly_requested(self):
+        args = SimpleNamespace(
+            keep_class=None,
+            keep_prefix=None,
+            keep_lib=None,
+            encrypt_asset=None,
+        )
+        config = {"keep_lib": ["mmkv"]}
+
+        with mock.patch(
+            "pack.extract_keep_classes_from_decoded_manifest",
+            return_value=[],
+        ):
+            _, _, keep_libs, _ = pack.collect_runtime_lists(args, config, "ignored")
+
+        self.assertEqual(keep_libs, ["mmkv"])
 
     def test_resolve_ks_pass_prefers_cli_then_config_then_env(self):
         with mock.patch.dict("pack.os.environ", {"CRABSHELL_KS_PASS": "env-pass"}, clear=False):

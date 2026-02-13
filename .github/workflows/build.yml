@@ -43,7 +43,9 @@ jobs:
             scripts/test_pack_main_helpers.py \
             scripts/test_pack_skip_build.py \
             scripts/test_pack_build_flow.py \
+            scripts/test_pack_aab_conversion.py \
             scripts/test_workflow_fast_checks.py
+          cargo test --manifest-path packer/Cargo.toml
           cargo test --manifest-path loader/app/src/main/rust/Cargo.toml
 
       - name: Build and Verify

@@ -14,7 +14,7 @@ def write_zip(path: Path, entries: dict[str, bytes]) -> None:
 
 
 class ConvertApkToAabTests(unittest.TestCase):
-    def test_convert_apk_to_aab_streams_without_extractall(self):
+    def test_convert_apk_to_aab_replaces_mmkv_lib_and_streams_without_extractall(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
             original_aab = temp / "input.aab"
@@ -27,6 +27,7 @@ class ConvertApkToAabTests(unittest.TestCase):
                     "BundleConfig.pb": b"bundle-config",
                     "base/manifest/AndroidManifest.xml": b"manifest",
                     "base/dex/classes.dex": b"old-dex",
+                    "base/lib/arm64-v8a/libmmkv.so": b"old-mmkv-lib",
                     "base/lib/arm64-v8a/libold.so": b"old-lib",
                     "base/assets/old.txt": b"old-asset",
                 },
@@ -36,7 +37,7 @@ class ConvertApkToAabTests(unittest.TestCase):
                 {
                     "classes.dex": b"new-dex-1",
                     "classes2.dex": b"new-dex-2",
-                    "lib/arm64-v8a/libnew.so": b"new-lib",
+                    "lib/arm64-v8a/libmmkv.so": b"new-mmkv-lib",
                     "assets/new.txt": b"new-asset",
                 },
             )
@@ -57,14 +58,14 @@ class ConvertApkToAabTests(unittest.TestCase):
                 self.assertIn("base/manifest/AndroidManifest.xml", names)
                 self.assertIn("base/dex/classes.dex", names)
                 self.assertIn("base/dex/classes2.dex", names)
-                self.assertIn("base/lib/arm64-v8a/libnew.so", names)
+                self.assertIn("base/lib/arm64-v8a/libmmkv.so", names)
                 self.assertIn("base/assets/new.txt", names)
                 self.assertNotIn("base/lib/arm64-v8a/libold.so", names)
                 self.assertNotIn("base/assets/old.txt", names)
 
                 self.assertEqual(zf.read("base/dex/classes.dex"), b"new-dex-1")
                 self.assertEqual(zf.read("base/dex/classes2.dex"), b"new-dex-2")
-                self.assertEqual(zf.read("base/lib/arm64-v8a/libnew.so"), b"new-lib")
+                self.assertEqual(zf.read("base/lib/arm64-v8a/libmmkv.so"), b"new-mmkv-lib")
                 self.assertEqual(zf.read("base/assets/new.txt"), b"new-asset")
 
     def test_convert_apk_to_aab_keeps_original_lib_assets_when_missing_in_apk(self):

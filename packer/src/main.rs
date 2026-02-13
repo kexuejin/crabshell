@@ -521,3 +521,125 @@ fn encrypt_payload(data: &[u8]) -> anyhow::Result<(Vec<u8>, [u8; 12])> {
 
     Ok((ciphertext, nonce_bytes))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn create(prefix: &str) -> Self {
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock before unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!("packer-{prefix}-{ts}"));
+            std::fs::create_dir_all(&path).expect("failed to create temp dir");
+            Self { path }
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn write_zip(path: &Path, entries: &[(&str, &[u8])]) -> anyhow::Result<()> {
+        let file = File::create(path)?;
+        let mut writer = ZipWriter::new(file);
+        let options = FileOptions::default().compression_method(CompressionMethod::Stored);
+        for (name, data) in entries {
+            writer.start_file(*name, options)?;
+            writer.write_all(data)?;
+        }
+        writer.finish()?;
+        Ok(())
+    }
+
+    #[test]
+    fn repack_target_encrypts_mmkv_and_excludes_plaintext_payload_entries() -> anyhow::Result<()> {
+        let temp = TestDir::create("artifact-audit");
+        let target_apk = temp.path.join("target.apk");
+        let bootstrap_apk = temp.path.join("bootstrap.apk");
+        let output_apk = temp.path.join("output.apk");
+        let bootstrap_lib_dir = temp.path.join("bootstrap-libs");
+        let arm64_dir = bootstrap_lib_dir.join("arm64-v8a");
+
+        std::fs::create_dir_all(&arm64_dir)?;
+        std::fs::write(arm64_dir.join("libshell.so"), b"shell-lib")?;
+
+        write_zip(
+            &target_apk,
+            &[
+                ("classes.dex", b"original-main-dex"),
+                ("classes2.dex", b"original-second-dex"),
+                ("lib/arm64-v8a/libmmkv.so", b"original-mmkv-lib"),
+                ("assets/secret.txt", b"original-secret-asset"),
+                ("res/raw/public.txt", b"public-resource"),
+            ],
+        )?;
+
+        write_zip(&bootstrap_apk, &[("classes.dex", b"bootstrap-dex")])?;
+
+        let empty: Vec<String> = Vec::new();
+        let encrypt_assets = vec!["assets/*".to_string()];
+
+        let entries = collect_and_encrypt_payload_entries(
+            &target_apk,
+            &empty,
+            &empty,
+            &empty,
+            &encrypt_assets,
+        )?;
+        let payload_blob = build_payload_blob(&entries);
+        let encrypted_entry_names = get_encrypted_names_from_blob(&payload_blob);
+
+        assert!(encrypted_entry_names.contains("classes.dex"));
+        assert!(encrypted_entry_names.contains("classes2.dex"));
+        assert!(encrypted_entry_names.contains("lib/arm64-v8a/libmmkv.so"));
+        assert!(encrypted_entry_names.contains("assets/secret.txt"));
+
+        repack_target_with_bootstrap(
+            &target_apk,
+            &bootstrap_apk,
+            &bootstrap_lib_dir,
+            None,
+            None,
+            &encrypted_entry_names,
+            &output_apk,
+            &payload_blob,
+        )?;
+
+        let mut out = ZipArchive::new(File::open(&output_apk)?)?;
+
+        // Encrypted payload blob must exist.
+        assert!(out.by_name("assets/kapp_payload.bin").is_ok());
+
+        // DEX is replaced by bootstrap DEX, not original target DEX bytes.
+        let mut dex = Vec::new();
+        out.by_name("classes.dex")?.read_to_end(&mut dex)?;
+        assert_eq!(dex, b"bootstrap-dex");
+        assert!(out.by_name("classes2.dex").is_err());
+
+        // Original plaintext payload files are removed from output.
+        assert!(out.by_name("lib/arm64-v8a/libmmkv.so").is_err());
+        assert!(out.by_name("assets/secret.txt").is_err());
+
+        // Shell runtime lib is injected and non-payload resources are kept.
+        let mut shell_lib = Vec::new();
+        out.by_name("lib/arm64-v8a/libshell.so")?
+            .read_to_end(&mut shell_lib)?;
+        assert_eq!(shell_lib, b"shell-lib");
+
+        let mut public = Vec::new();
+        out.by_name("res/raw/public.txt")?.read_to_end(&mut public)?;
+        assert_eq!(public, b"public-resource");
+
+        Ok(())
+    }
+}
