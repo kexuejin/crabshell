@@ -1,18 +1,41 @@
-# CrabShell 🦀（Android Packer）
+# CrabShell 🦀（Android 加固工具包）
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Build Status](https://github.com/kexuejin/crabshell/actions/workflows/build.yml/badge.svg)
 ![Rust](https://img.shields.io/badge/rust-1.70%2B-orange)
 ![Android](https://img.shields.io/badge/android-API%2024%2B-green)
 
-CrabShell 是一个面向 APK/AAB 流水线的 Android 应用加固工具。它会对 DEX 与 native 库进行加密，补丁化运行时引导组件，并支持基于 Rust + Python + Android shell runtime 的端到端打包与签名。
+> 面向 APK/AAB 流水线的 Android 加固工具包，提供 Rust 打包器、DEX/native payload 加密与壳运行时引导。
 
-适用场景：
-- 在 CI/CD 中自动化执行 APK/AAB 加固。
-- 在运行时解密并加载 DEX/native payload。
-- 需要可研究、可二次开发的 Android 保护链路源码。
+![CrabShell 演示](docs/demo.gif)
 
-**[English README](README.md)**
+静态预览图： [docs/prototype.png](docs/prototype.png)
+
+**[English README](README.md)** | **[GUI 使用说明](crabshell-gui/README.md)** | **[最新发布](https://github.com/kexuejin/crabshell/releases/latest)**
+
+## 为什么用 CrabShell
+
+- 以目标 APK 作为最终基底，尽量保留原始资源与 Manifest。
+- 将 `classes*.dex` 与 `lib/**/*.so` 打包加密为统一 payload，并在运行时解密加载。
+- 同时支持 CLI 自动化（CI/CD）与桌面 GUI 操作（Tauri）。
+
+## 快速上手（3 步）
+
+1. 安装依赖：Python 3、Rust、JDK 17+、`apktool`、Android build-tools（`apksigner`）。
+2. 执行加固：
+   ```bash
+   python3 pack.py --target /path/to/your/app.apk --output protected.apk
+   ```
+3. 安装并验证输出 APK。未传签名参数时，CrabShell 会使用 debug keystore 自动签名。
+
+## 支持范围
+
+| 维度 | 状态 | 说明 |
+| --- | --- | --- |
+| 输入格式 | APK ✅ / AAB ⚠️ | AAB 能力取决于 bundletool 转换链路和目标应用兼容性。 |
+| Android 运行时 | API 24+ ✅ | API 26+ 使用内存 DEX 加载（`InMemoryDexClassLoader`）。 |
+| 签名 | Debug 自动签名 ✅ / 自定义签名 ✅ | 支持 `--no-sign` 交给外部流程签名。 |
+| 桌面 GUI 打包 | macOS/Linux/Windows ✅ | 由 `.github/workflows/release.yml` 构建。 |
 
 ## 功能特性
 
@@ -52,7 +75,7 @@ CrabShell 是一个面向 APK/AAB 流水线的 Android 应用加固工具。它�
 - **apktool**：用于目标 Manifest 补丁与重建。
 - **Android build-tools**：`apksigner`（必需），`zipalign`（推荐）。
 
-## 快速开始
+## 详细安装与使用
 
 ### 配置文件（可选）
 

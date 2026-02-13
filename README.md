@@ -1,18 +1,41 @@
-# CrabShell 🦀 (Android Packer)
+# CrabShell 🦀 (Android Hardening Toolkit)
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Build Status](https://github.com/kexuejin/crabshell/actions/workflows/build.yml/badge.svg)
 ![Rust](https://img.shields.io/badge/rust-1.70%2B-orange)
 ![Android](https://img.shields.io/badge/android-API%2024%2B-green)
 
-CrabShell is an Android app hardening toolkit for APK/AAB pipelines. It encrypts DEX and native libraries, patches runtime bootstrap components, and supports end-to-end packing/signing with Rust + Python + Android shell runtime.
+> Android APK/AAB hardening toolkit with Rust packer, encrypted DEX/native payload, and shell runtime bootstrap.
 
-Use this project if you need:
-- APK/AAB hardening automation in CI/CD.
-- Runtime DEX/native payload decryption and loading.
-- A research-oriented Android protection pipeline with source code.
+![CrabShell Demo](docs/demo.gif)
 
-**[中文文档](README_CN.md)**
+Fallback static preview: [docs/prototype.png](docs/prototype.png)
+
+**[中文文档](README_CN.md)** | **[GUI Guide](crabshell-gui/README.md)** | **[Latest Release](https://github.com/kexuejin/crabshell/releases/latest)**
+
+## Why CrabShell
+
+- Preserve target app resources and manifest by using the original APK as the final base.
+- Encrypt `classes*.dex` and `lib/**/*.so` into one payload and decrypt at runtime.
+- Support both CLI automation (CI/CD) and desktop GUI operations (Tauri).
+
+## Quick Start (3 Steps)
+
+1. Install prerequisites: Python 3, Rust, JDK 17+, `apktool`, and Android build-tools (`apksigner`).
+2. Run hardening:
+   ```bash
+   python3 pack.py --target /path/to/your/app.apk --output protected.apk
+   ```
+3. Install/verify output APK. If signing arguments are omitted, CrabShell auto-signs with debug keystore.
+
+## Support Matrix
+
+| Area | Status | Notes |
+| --- | --- | --- |
+| Input formats | APK ✅ / AAB ⚠️ | AAB support depends on bundletool conversion and target app compatibility. |
+| Android runtime | API 24+ ✅ | API 26+ uses in-memory DEX loading (`InMemoryDexClassLoader`). |
+| Signing | Debug auto-sign ✅ / custom keystore ✅ | `--no-sign` is available for external signing workflows. |
+| Desktop GUI packaging | macOS/Linux/Windows ✅ | Built via `.github/workflows/release.yml`. |
 
 ## Features
 
@@ -52,7 +75,7 @@ The project consists of two main components:
 -   **apktool**: Required for target manifest patch/rebuild.
 -   **Android build-tools**: `apksigner` (required), `zipalign` (recommended).
 
-## Quick Start
+## Detailed Setup and Usage
 
 ### Configuration File (Optional)
 

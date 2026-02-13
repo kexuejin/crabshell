@@ -1,0 +1,33 @@
+changelog:
+  exclude:
+    labels:
+      - skip-changelog
+      - duplicate
+      - invalid
+      - question
+      - wontfix
+  categories:
+    - title: Breaking Changes
+      labels:
+        - breaking-change
+        - semver-major
+    - title: GUI (Tauri + React)
+      labels:
+        - gui
+        - tauri
+        - frontend
+    - title: Core Packer and Runtime
+      labels:
+        - packer
+        - loader
+        - runtime
+        - android
+    - title: CI, Build, and Tooling
+      labels:
+        - ci
+        - build
+        - tooling
+        - docs
+    - title: Other Changes
+      labels:
+        - "*"
