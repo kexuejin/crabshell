@@ -87,6 +87,29 @@ fn select_output(default_path: String) -> Option<String> {
         .map(|path| path.to_string_lossy().to_string())
 }
 
+fn apply_signing_options(
+    args: &mut Vec<String>,
+    signing: &SigningConfig,
+) -> Option<(String, String)> {
+    if signing.use_debug {
+        return None;
+    }
+
+    if let Some(keystore) = signing.keystore.as_ref() {
+        args.push("--keystore".to_string());
+        args.push(keystore.clone());
+    }
+    if let Some(alias) = signing.alias.as_ref() {
+        args.push("--key-alias".to_string());
+        args.push(alias.clone());
+    }
+
+    signing
+        .password
+        .as_ref()
+        .map(|password| ("CRABSHELL_KS_PASS".to_string(), password.clone()))
+}
+
 #[tauri::command]
 fn start_hardening(
     app: AppHandle,
@@ -115,20 +138,7 @@ fn start_hardening(
         config.output_format.clone(),
     ];
 
-    if !config.signing.use_debug {
-        if let Some(keystore) = config.signing.keystore {
-            args.push("--keystore".to_string());
-            args.push(keystore);
-        }
-        if let Some(password) = config.signing.password {
-            args.push("--ks-pass".to_string());
-            args.push(password);
-        }
-        if let Some(alias) = config.signing.alias {
-            args.push("--key-alias".to_string());
-            args.push(alias);
-        }
-    }
+    let signing_env = apply_signing_options(&mut args, &config.signing);
 
     for class_name in config.advanced.keep_classes {
         args.push("--keep-class".to_string());
@@ -174,6 +184,10 @@ fn start_hardening(
         .current_dir(working_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    if let Some((key, value)) = signing_env {
+        cmd.env(key, value);
+    }
 
     apply_java_env_fallbacks(&mut cmd);
 
@@ -392,8 +406,29 @@ fn resolve_pack_py_path(app: &AppHandle) -> Option<PathBuf> {
     None
 }
 
+fn merge_path_entries(
+    current_path: &std::ffi::OsStr,
+    preferred: Option<PathBuf>,
+    additional: Vec<PathBuf>,
+) -> std::ffi::OsString {
+    let mut entries: Vec<PathBuf> = std::env::split_paths(current_path).collect();
+
+    if let Some(preferred_path) = preferred {
+        entries.retain(|entry| entry != &preferred_path);
+        entries.insert(0, preferred_path);
+    }
+
+    for candidate in additional {
+        if !entries.iter().any(|entry| entry == &candidate) {
+            entries.push(candidate);
+        }
+    }
+
+    std::env::join_paths(entries.iter()).unwrap_or_else(|_| current_path.to_os_string())
+}
+
 fn apply_java_env_fallbacks(cmd: &mut Command) {
-    let current_path = std::env::var("PATH").unwrap_or_default();
+    let current_path = std::env::var_os("PATH").unwrap_or_default();
     let java_candidate_bins = [
         "/opt/homebrew/opt/openjdk@21/bin",
         "/opt/homebrew/opt/openjdk@17/bin",
@@ -403,7 +438,7 @@ fn apply_java_env_fallbacks(cmd: &mut Command) {
         "/usr/local/opt/openjdk/bin",
     ];
 
-    let mut preferred_java_bin: Option<String> = None;
+    let mut preferred_java_bin: Option<PathBuf> = None;
     for bin_dir in java_candidate_bins {
         let java_bin = Path::new(bin_dir).join("java");
         if !java_bin.is_file() {
@@ -412,30 +447,20 @@ fn apply_java_env_fallbacks(cmd: &mut Command) {
 
         if let Ok(output) = Command::new(&java_bin).arg("-version").output() {
             if output.status.success() {
-                preferred_java_bin = Some(bin_dir.to_string());
+                preferred_java_bin = Some(PathBuf::from(bin_dir));
                 break;
             }
         }
     }
 
-    let mut path_entries: Vec<String> = current_path
-        .split(':')
-        .filter(|entry| !entry.is_empty())
-        .map(|entry| entry.to_string())
+    let available_candidates: Vec<PathBuf> = java_candidate_bins
+        .iter()
+        .map(PathBuf::from)
+        .filter(|candidate| candidate.is_dir())
         .collect();
 
-    if let Some(preferred) = preferred_java_bin.as_ref() {
-        path_entries.retain(|entry| entry != preferred);
-        path_entries.insert(0, preferred.clone());
-    }
-
-    for candidate in java_candidate_bins {
-        if Path::new(candidate).is_dir() && !path_entries.iter().any(|entry| entry == candidate) {
-            path_entries.push(candidate.to_string());
-        }
-    }
-
-    cmd.env("PATH", path_entries.join(":"));
+    let merged_path = merge_path_entries(&current_path, preferred_java_bin.clone(), available_candidates);
+    cmd.env("PATH", merged_path);
 
     let mut java_home_to_set: Option<String> = None;
     if let Ok(existing_java_home) = std::env::var("JAVA_HOME") {
@@ -453,7 +478,7 @@ fn apply_java_env_fallbacks(cmd: &mut Command) {
 
     if java_home_to_set.is_none() {
         if let Some(preferred) = preferred_java_bin.as_ref() {
-            if let Some(parent) = Path::new(preferred).parent() {
+            if let Some(parent) = preferred.parent() {
                 java_home_to_set = Some(parent.to_string_lossy().to_string());
             }
         }
@@ -607,6 +632,13 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
+    use std::path::PathBuf;
+
+    fn path_parts(path: &OsStr) -> Vec<PathBuf> {
+        std::env::split_paths(path).collect()
+    }
+
     #[test]
     fn redact_sensitive_cli_args_masks_password_values() {
         let args = vec![
@@ -621,5 +653,58 @@ mod tests {
         let rendered = super::redact_cli_args_for_log(&args);
         assert!(rendered.contains("--ks-pass ******"));
         assert!(!rendered.contains("secret123"));
+    }
+
+    #[test]
+    fn merge_path_entries_moves_preferred_to_front_and_dedupes() {
+        let a = PathBuf::from("path-a");
+        let b = PathBuf::from("path-b");
+        let c = PathBuf::from("path-c");
+
+        let current = std::env::join_paths([a.clone(), b.clone()]).expect("join current path");
+        let merged = super::merge_path_entries(
+            &current,
+            Some(b.clone()),
+            vec![b.clone(), c.clone()],
+        );
+
+        assert_eq!(path_parts(&merged), vec![b, a, c]);
+    }
+
+    #[test]
+    fn merge_path_entries_keeps_order_when_no_preferred() {
+        let a = PathBuf::from("path-a");
+        let b = PathBuf::from("path-b");
+        let c = PathBuf::from("path-c");
+
+        let current = std::env::join_paths([a.clone(), b.clone()]).expect("join current path");
+        let merged =
+            super::merge_path_entries(&current, None, vec![PathBuf::from("path-b"), c.clone()]);
+
+        assert_eq!(path_parts(&merged), vec![a, b, c]);
+    }
+
+    #[test]
+    fn apply_signing_options_uses_env_for_password_not_cli_arg() {
+        let mut args = vec!["pack.py".to_string()];
+        let signing = super::SigningConfig {
+            use_debug: false,
+            keystore: Some("release.jks".to_string()),
+            password: Some("super-secret".to_string()),
+            alias: Some("release".to_string()),
+        };
+
+        let env = super::apply_signing_options(&mut args, &signing);
+
+        assert_eq!(
+            env,
+            Some(("CRABSHELL_KS_PASS".to_string(), "super-secret".to_string()))
+        );
+        assert!(args.contains(&"--keystore".to_string()));
+        assert!(args.contains(&"release.jks".to_string()));
+        assert!(args.contains(&"--key-alias".to_string()));
+        assert!(args.contains(&"release".to_string()));
+        assert!(!args.contains(&"--ks-pass".to_string()));
+        assert!(!args.contains(&"super-secret".to_string()));
     }
 }

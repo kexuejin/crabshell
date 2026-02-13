@@ -60,6 +60,12 @@ class PackMainHelpersTests(unittest.TestCase):
         self.assertEqual(keep_libs, ["sqlite", "mmkv"])
         self.assertEqual(encrypt_assets, ["assets/*.js"])
 
+    def test_resolve_ks_pass_prefers_cli_then_config_then_env(self):
+        with mock.patch.dict("pack.os.environ", {"CRABSHELL_KS_PASS": "env-pass"}, clear=False):
+            self.assertEqual(pack.resolve_ks_pass("cli-pass", "cfg-pass"), "cli-pass")
+            self.assertEqual(pack.resolve_ks_pass(None, "cfg-pass"), "cfg-pass")
+            self.assertEqual(pack.resolve_ks_pass(None, None), "env-pass")
+
 
 if __name__ == "__main__":
     unittest.main()

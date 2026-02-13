@@ -194,8 +194,9 @@ pub extern "system" fn Java_com_kapp_shell_ShellApplication_nativeLoadDex<'local
 
     if let Err(e) = verify_integrity(&mut env, &context) {
         error!("Integrity check failed: {:?}", e);
-        // In a real hardened app, we should probably exit here.
-        // std::process::exit(1);
+        let _ = env.exception_clear();
+        clear_dex_load_marker();
+        return;
     }
 
     let payload = match extract_payload(&apk_path, true) {
@@ -322,7 +323,9 @@ pub extern "system" fn Java_com_kapp_shell_BootstrapProvider_nativeLoadDex<'loca
 
     if let Err(e) = verify_integrity(&mut env, &context) {
         error!("Integrity check failed: {:?}", e);
-        // std::process::exit(1);
+        let _ = env.exception_clear();
+        clear_dex_load_marker();
+        return;
     }
 
     let payload = match extract_payload(&apk_path, true) {
@@ -413,40 +416,112 @@ fn get_package_code_path(env: &mut JNIEnv, context: &JObject) -> Result<String, 
     Ok(path_str)
 }
 
+fn validate_signature_hash(expected: &[u8; 32], actual: &[u8; 32]) -> Result<(), String> {
+    if expected.iter().all(|&b| b == 0) {
+        warn!("Signature hash check skipped (embedded hash is zero).");
+        return Ok(());
+    }
+
+    if actual != expected {
+        return Err(format!(
+            "Signature mismatch! Expected: {}, Actual: {}",
+            hex::encode(expected),
+            hex::encode(actual)
+        ));
+    }
+
+    Ok(())
+}
+
+fn extract_signature_bytes(
+    env: &mut JNIEnv,
+    package_info: &JObject,
+) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+    if let Ok(signing_info_obj) = env
+        .get_field(package_info, "signingInfo", "Landroid/content/pm/SigningInfo;")
+        .and_then(|value| value.l())
+    {
+        if !signing_info_obj.is_null() {
+            let signers_obj = env
+                .call_method(
+                    &signing_info_obj,
+                    "getApkContentsSigners",
+                    "()[Landroid/content/pm/Signature;",
+                    &[],
+                )?
+                .l()?;
+            let signers_array: JObjectArray = signers_obj.into();
+            if env.get_array_length(&signers_array)? > 0 {
+                let signature = env.get_object_array_element(&signers_array, 0)?;
+                let cert_bytes_j = env.call_method(&signature, "toByteArray", "()[B", &[])?.l()?;
+                let cert_bytes: Vec<u8> = env.convert_byte_array(&JByteArray::from(cert_bytes_j))?;
+                return Ok(Some(cert_bytes));
+            }
+        }
+    } else {
+        let _ = env.exception_clear();
+    }
+
+    if let Ok(signatures_obj) = env
+        .get_field(package_info, "signatures", "[Landroid/content/pm/Signature;")
+        .and_then(|value| value.l())
+    {
+        let signatures_array: JObjectArray = signatures_obj.into();
+        if env.get_array_length(&signatures_array)? > 0 {
+            let signature = env.get_object_array_element(&signatures_array, 0)?;
+            let cert_bytes_j = env.call_method(&signature, "toByteArray", "()[B", &[])?.l()?;
+            let cert_bytes: Vec<u8> = env.convert_byte_array(&JByteArray::from(cert_bytes_j))?;
+            return Ok(Some(cert_bytes));
+        }
+    } else {
+        let _ = env.exception_clear();
+    }
+
+    Ok(None)
+}
+
 fn verify_integrity(
     env: &mut JNIEnv,
     context: &JObject,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Verify APK Signature
     info!("Verifying APK signature...");
     let package_name = env.call_method(context, "getPackageName", "()Ljava/lang/String;", &[])?.l()?;
     let pm = env.call_method(context, "getPackageManager", "()Landroid/content/pm/PackageManager;", &[])?.l()?;
-    
-    // GET_SIGNATURES = 64
-    let package_info = env.call_method(&pm, "getPackageInfo", "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;", &[
-        (&package_name).into(),
-        64i32.into(),
-    ])?.l()?;
-    
-    let signatures_array: JObjectArray = env.get_field(&package_info, "signatures", "[Landroid/content/pm/Signature;")?.l()?.into();
-    if env.get_array_length(&signatures_array)? > 0 {
-        let signature = env.get_object_array_element(&signatures_array, 0)?;
-        let cert_bytes_j = env.call_method(&signature, "toByteArray", "()[B", &[])?.l()?;
-        let cert_bytes: Vec<u8> = env.convert_byte_array(&JByteArray::from(cert_bytes_j))?;
-        
-        let mut hasher = Sha256::new();
-        hasher.update(&cert_bytes);
-        let hash = hasher.finalize();
-        
-        if hash.as_slice() != EXPECTED_SIGNATURE_HASH {
-            error!("Signature mismatch! Expected: {}, Actual: {}", 
-                hex::encode(EXPECTED_SIGNATURE_HASH), 
-                hex::encode(hash));
-            return Err("Signature integrity check failed".into());
+
+    // Prefer modern flag first (API 28+), then fallback to legacy flag.
+    const GET_SIGNING_CERTIFICATES: i32 = 0x08000000;
+    const GET_SIGNATURES: i32 = 64;
+    let package_info = match env.call_method(
+        &pm,
+        "getPackageInfo",
+        "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;",
+        &[(&package_name).into(), GET_SIGNING_CERTIFICATES.into()],
+    ) {
+        Ok(value) => value.l()?,
+        Err(_) => {
+            let _ = env.exception_clear();
+            env.call_method(
+                &pm,
+                "getPackageInfo",
+                "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;",
+                &[(&package_name).into(), GET_SIGNATURES.into()],
+            )?
+            .l()?
         }
+    };
+
+    let cert_bytes = extract_signature_bytes(env, &package_info)?
+        .ok_or("No signatures found in PackageInfo")?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(&cert_bytes);
+    let hash: [u8; 32] = hasher.finalize().into();
+
+    validate_signature_hash(&EXPECTED_SIGNATURE_HASH, &hash)
+        .map_err(Box::<dyn std::error::Error>::from)?;
+
+    if EXPECTED_SIGNATURE_HASH.iter().any(|&b| b != 0) {
         info!("Signature integrity verified.");
-    } else {
-        warn!("No signatures found in PackageInfo.");
     }
 
     Ok(())
@@ -568,6 +643,7 @@ fn decrypt_payload(
     Ok(results)
 }
 
+#[allow(dead_code)]
 fn load_in_memory(env: &mut JNIEnv, cache_path: &str, target_loader: &JObject, file_list: &[(String, Vec<u8>)]) -> Result<(), jni::errors::Error> {
     info!("load_in_memory called with {} items", file_list.len());
     // 1. Separate DEXs and Libs
@@ -770,6 +846,7 @@ fn load_file_landing(env: &mut JNIEnv, cache_path: &str, target_loader: &JObject
     Ok(())
 }
 
+#[allow(dead_code)]
 fn inject_dex_elements(env: &mut JNIEnv, source_loader: &JObject, target_loader: &JObject) -> Result<(), jni::errors::Error> {
     info!("shell: inject_dex_elements starting...");
     
@@ -815,7 +892,9 @@ fn inject_dex_elements(env: &mut JNIEnv, source_loader: &JObject, target_loader:
 
 #[cfg(test)]
 mod tests {
-    use super::{clear_dex_load_marker_for_tests, try_mark_dex_load_started};
+    use super::{
+        clear_dex_load_marker_for_tests, try_mark_dex_load_started, validate_signature_hash,
+    };
 
     #[test]
     fn dex_load_marker_allows_only_first_call() {
@@ -826,5 +905,26 @@ mod tests {
 
         clear_dex_load_marker_for_tests();
         assert!(try_mark_dex_load_started());
+    }
+
+    #[test]
+    fn signature_hash_validation_skips_when_expected_is_zero() {
+        let expected = [0u8; 32];
+        let actual = [1u8; 32];
+        assert!(validate_signature_hash(&expected, &actual).is_ok());
+    }
+
+    #[test]
+    fn signature_hash_validation_fails_on_mismatch() {
+        let expected = [7u8; 32];
+        let actual = [8u8; 32];
+        assert!(validate_signature_hash(&expected, &actual).is_err());
+    }
+
+    #[test]
+    fn signature_hash_validation_passes_on_exact_match() {
+        let expected = [3u8; 32];
+        let actual = [3u8; 32];
+        assert!(validate_signature_hash(&expected, &actual).is_ok());
     }
 }

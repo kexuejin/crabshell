@@ -37,6 +37,15 @@ jobs:
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
 
+      - name: Run fast CLI tests
+        run: |
+          python3 -m unittest \
+            scripts/test_pack_main_helpers.py \
+            scripts/test_pack_skip_build.py \
+            scripts/test_pack_build_flow.py \
+            scripts/test_workflow_fast_checks.py
+          cargo test --manifest-path loader/app/src/main/rust/Cargo.toml
+
       - name: Build and Verify
         run: |
           chmod +x verify.sh

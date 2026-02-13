@@ -859,11 +859,8 @@ def build_shell():
             f"--- stderr (tail) ---\n{stderr_tail}"
         )
 
-    print("Building Packer...")
-    run_checked_command(["cargo", "build", "--release"], "Build Packer", cwd=PACKER_DIR, env=env)
 
-
-def get_shell_apk_path() -> str:
+def get_shell_apk_path(require_exists: bool = True) -> str:
     shell_apk = os.path.join(
         SHELL_PROJECT_DIR,
         "app",
@@ -873,7 +870,7 @@ def get_shell_apk_path() -> str:
         "release",
         "app-release-unsigned.apk",
     )
-    if not os.path.exists(shell_apk):
+    if require_exists and not os.path.exists(shell_apk):
         raise FileNotFoundError(f"Shell APK not found at {shell_apk}")
     return shell_apk
 
@@ -1398,6 +1395,10 @@ def resolve_signing(
     return get_default_debug_signing()
 
 
+def resolve_ks_pass(cli_ks_pass: Optional[str], config_ks_pass: Optional[str]) -> Optional[str]:
+    return cli_ks_pass or config_ks_pass or os.environ.get("CRABSHELL_KS_PASS")
+
+
 def load_config(config_path):
     if os.path.exists(config_path):
         with open(config_path, "r") as f:
@@ -1492,7 +1493,6 @@ def maybe_build_toolchain(skip_build: bool, original_app: str, original_factory:
         return
     build_packer()
     patch_shell_loader_constants(original_app, original_factory)
-    build_shell()
 
 
 def prepare_target_manifest(
@@ -1526,7 +1526,7 @@ def main():
     target = args.target or config.get("target")
     output = args.output if args.output != "protected.apk" else config.get("output", "protected.apk")
     keystore = args.keystore or config.get("keystore")
-    ks_pass = args.ks_pass or config.get("ks_pass")
+    ks_pass = resolve_ks_pass(args.ks_pass, config.get("ks_pass"))
     key_alias = args.key_alias or config.get("key_alias")
     no_sign = args.no_sign or config.get("no_sign", False)
     skip_build = args.skip_build or config.get("skip_build", False)
@@ -1564,7 +1564,7 @@ def main():
 
         maybe_build_toolchain(skip_build, original_app, original_factory)
 
-        bootstrap_apk = get_shell_apk_path()
+        bootstrap_apk = get_shell_apk_path(require_exists=False)
         keep_classes, keep_prefixes, keep_libs, encrypt_assets = collect_runtime_lists(
             args, config, decoded_dir
         )
