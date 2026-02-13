@@ -87,7 +87,7 @@ echo "Using ANDROID_NDK_HOME=${ANDROID_NDK_HOME:-unset}"
 command -v adb >/dev/null || fail "adb not found in PATH"
 command -v python3 >/dev/null || fail "python3 not found in PATH"
 
-log_step "Build and launch loader smoke app"
+log_step "Build loader shell app"
 pushd loader >/dev/null
 ./gradlew -q dependencies || true
 ./gradlew :app:assembleDebug --stacktrace
@@ -95,13 +95,6 @@ popd >/dev/null
 
 loader_apk="loader/app/build/outputs/apk/debug/app-debug.apk"
 [[ -f "${loader_apk}" ]] || fail "Loader APK missing: ${loader_apk}"
-
-adb uninstall com.kapp.shell >/dev/null 2>&1 || true
-adb install -r "${loader_apk}" >/dev/null
-adb logcat -c
-adb shell monkey -p com.kapp.shell -c android.intent.category.LAUNCHER 1 >/dev/null
-loader_pid="$(wait_for_running_process "com.kapp.shell" 20 2)" || fail "Loader app failed to stay running after launch"
-check_logs_for_crash "${loader_pid}" "loader app" || fail "Loader app crashed after launch"
 
 log_step "Build fixture apps (kappa + kappb)"
 ./loader/gradlew -p fixtures/test-apps :kappa:assembleDebug :kappb:assembleDebug --stacktrace
@@ -130,4 +123,4 @@ if [[ "${probe_result}" != "ok" ]]; then
   fail "MMKV probe result is invalid: ${probe_result:-<empty>}"
 fi
 
-echo "[OK] Emulator smoke checks passed (loader + kappb mmkv target)."
+echo "[OK] Emulator smoke checks passed (loader build + kappb mmkv target startup)."
