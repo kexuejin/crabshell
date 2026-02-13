@@ -12,9 +12,6 @@ Use this project if you need:
 - Runtime DEX/native payload decryption and loading.
 - A research-oriented Android protection pipeline with source code.
 
-Recommended GitHub repository description:
-`Android APK/AAB hardening toolkit with Rust packer, encrypted DEX/native payload, and shell runtime bootstrap.`
-
 **[中文文档](README_CN.md)**
 
 ## Features
@@ -156,12 +153,6 @@ Workflow: `.github/workflows/build.yml`
   - Or manual trigger: `workflow_dispatch` with inputs: `tag`, `prerelease`
   - Publishes `.dmg`, `.deb`, `.AppImage`, `.msi`, `.exe` to GitHub Releases
   - Release assets are normalized as `CrabShell-<tag>-<original-file-name>`
-
-## Recommended GitHub Topics
-
-Add these topics in repository **About → Topics**:
-
-`android`, `android-security`, `mobile-security`, `apk`, `aab`, `app-hardening`, `obfuscation`, `dex`, `dex-encryption`, `jni`, `rust`, `tauri`, `apktool`, `reverse-engineering`, `application-security`
 
 ## Disclaimer
 

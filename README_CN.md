@@ -12,9 +12,6 @@ CrabShell 是一个面向 APK/AAB 流水线的 Android 应用加固工具。它�
 - 在运行时解密并加载 DEX/native payload。
 - 需要可研究、可二次开发的 Android 保护链路源码。
 
-推荐 GitHub 仓库描述：
-`Android APK/AAB hardening toolkit with Rust packer, encrypted DEX/native payload, and shell runtime bootstrap.`
-
 **[English README](README.md)**
 
 ## 功能特性
@@ -161,12 +158,6 @@ cd ../../../..
   - 或手动触发：`workflow_dispatch`（参数：`tag`、`prerelease`）
   - 发布 `.dmg`、`.deb`、`.AppImage`、`.msi`、`.exe` 到 GitHub Releases
   - 发布资产命名为：`CrabShell-<tag>-<original-file-name>`
-
-## 推荐 GitHub Topics
-
-推荐使用以下主题标签：
-
-`android`, `apk`, `aab`, `android-security`, `app-hardening`, `dex`, `dex-encryption`, `rust`, `tauri`, `apktool`
 
 ## 免责声明
 
