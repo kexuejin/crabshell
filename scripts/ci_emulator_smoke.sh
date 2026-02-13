@@ -78,6 +78,24 @@ wait_for_package_manager() {
   return 1
 }
 
+wait_for_boot_completed() {
+  local retries="${1:-60}"
+  local sleep_seconds="${2:-2}"
+  local sys_boot=""
+  local dev_boot=""
+
+  for ((i = 0; i < retries; i++)); do
+    sys_boot="$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)"
+    dev_boot="$(adb shell getprop dev.bootcomplete 2>/dev/null | tr -d '\r' || true)"
+    if [[ "${sys_boot}" == "1" && "${dev_boot}" == "1" ]]; then
+      return 0
+    fi
+    sleep "${sleep_seconds}"
+  done
+
+  return 1
+}
+
 adb_install_with_retry() {
   local apk_path="$1"
   local retries="${2:-4}"
@@ -85,14 +103,19 @@ adb_install_with_retry() {
   local output=""
 
   for ((attempt = 1; attempt <= retries; attempt++)); do
-    if output="$(adb install -r "${apk_path}" 2>&1)"; then
+    adb wait-for-device >/dev/null 2>&1 || true
+    wait_for_boot_completed 30 2 || true
+    wait_for_package_manager 30 2 || true
+
+    if output="$(adb install --no-streaming --no-fastdeploy -r "${apk_path}" 2>&1)"; then
       return 0
     fi
 
     echo "[WARN] adb install failed (attempt ${attempt}/${retries}): ${output}"
     if ((attempt < retries)); then
       adb wait-for-device >/dev/null 2>&1 || true
-      wait_for_package_manager 10 2 || true
+      wait_for_boot_completed 30 2 || true
+      wait_for_package_manager 30 2 || true
       sleep "${sleep_seconds}"
     fi
   done
@@ -155,6 +178,7 @@ python3 scripts/check_hardened_apk.py \
   --max-plaintext-dex 1
 
 log_step "Install and launch protected mmkv target"
+wait_for_boot_completed 60 2 || fail "Android emulator did not finish booting"
 wait_for_package_manager 30 2 || fail "Android package manager is not ready"
 adb uninstall com.example.kappb >/dev/null 2>&1 || true
 adb_install_with_retry "${mmkv_output_apk}" 4 3 || fail "Failed to install protected MMKV target APK"
