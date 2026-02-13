@@ -81,11 +81,30 @@ const SUBSTAGE_TRANSLATION_KEYS: Record<string, string> = {
   'manifest.cache-hit': 'progress.substage.manifestCacheHit',
   'manifest.cache-store': 'progress.substage.manifestCacheStore',
   'manifest.done': 'progress.substage.manifestDone',
+  'toolchain.download': 'progress.substage.toolchainDownload',
   'toolchain.reuse': 'progress.substage.toolchainReuse',
   'toolchain.build': 'progress.substage.toolchainBuild',
   'rules.resolve': 'progress.substage.rulesResolve',
   'signing.resolve': 'progress.substage.signingResolve',
 };
+
+const INIT_SUBSTAGE_STEP_INDEX: Record<string, number> = {
+  'env.runtime': 1,
+  'env.java': 2,
+  'config.load': 3,
+  'paths.resolve': 4,
+  'keys.prepare': 5,
+  'manifest.prepare': 6,
+  'manifest.cache-hit': 7,
+  'manifest.cache-store': 7,
+  'manifest.done': 8,
+  'toolchain.download': 9,
+  'toolchain.reuse': 10,
+  'toolchain.build': 10,
+  'rules.resolve': 11,
+  'signing.resolve': 12,
+};
+const INIT_SUBSTAGE_TOTAL_STEPS = 12;
 
 const formatSubstageFallback = (substage: string) =>
   substage
@@ -171,6 +190,22 @@ const App: React.FC = () => {
 
     return t('app.stageOnly', { stage: stageLabel });
   }, [progress.stage, stageLabel, substageLabel, t]);
+
+  const initStepText = useMemo(() => {
+    if (progress.stage !== 'init' || !progress.substage) {
+      return '';
+    }
+
+    const currentStep = INIT_SUBSTAGE_STEP_INDEX[progress.substage];
+    if (!currentStep) {
+      return '';
+    }
+
+    return t('app.initStepCounter', {
+      current: currentStep,
+      total: INIT_SUBSTAGE_TOTAL_STEPS,
+    });
+  }, [progress.stage, progress.substage, t]);
 
   const etaText = useMemo(() => {
     if (!isProcessing || !runStartedAt || progress.stage !== 'init') {
@@ -544,7 +579,7 @@ const App: React.FC = () => {
           </Typography>
           {stageContextText ? (
             <Typography variant="caption" sx={{ color: '#334155', mb: 0.5, display: 'block' }}>
-              {etaText ? `${stageContextText} · ${etaText}` : stageContextText}
+              {[stageContextText, initStepText, etaText].filter(Boolean).join(' · ')}
             </Typography>
           ) : null}
           <LinearProgress

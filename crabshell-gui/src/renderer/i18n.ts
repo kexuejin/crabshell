@@ -15,6 +15,7 @@ const resources = {
         statusLoading: '{{message}}',
         stageOnly: 'Stage: {{stage}}',
         stageWithSubstage: 'Stage: {{stage}} / {{substage}}',
+        initStepCounter: 'Init steps: {{current}}/{{total}}',
         etaSeconds: '~{{seconds}}s remaining',
       },
       messages: {
@@ -101,6 +102,7 @@ const resources = {
           manifestCacheHit: 'Manifest cache hit',
           manifestCacheStore: 'Manifest cache update',
           manifestDone: 'Manifest patch complete',
+          toolchainDownload: 'Toolchain download',
           toolchainReuse: 'Reuse existing artifacts',
           toolchainBuild: 'Build toolchain',
           rulesResolve: 'Runtime rules resolve',
@@ -120,6 +122,7 @@ const resources = {
         statusLoading: '{{message}}',
         stageOnly: '阶段：{{stage}}',
         stageWithSubstage: '阶段：{{stage}} / {{substage}}',
+        initStepCounter: '初始化步骤：{{current}}/{{total}}',
         etaSeconds: '预计剩余 ~{{seconds}} 秒',
       },
       messages: {
@@ -206,6 +209,7 @@ const resources = {
           manifestCacheHit: '清单缓存命中',
           manifestCacheStore: '清单缓存更新',
           manifestDone: '清单补丁完成',
+          toolchainDownload: '工具链下载',
           toolchainReuse: '复用现有构建产物',
           toolchainBuild: '构建工具链',
           rulesResolve: '运行时规则解析',

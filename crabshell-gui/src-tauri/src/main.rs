@@ -594,7 +594,7 @@ fn parse_progress(output: &str) -> Option<HardeningProgress> {
             .unwrap_or("dependency");
         return Some(HardeningProgress {
             stage: "init".to_string(),
-            substage: None,
+            substage: Some("toolchain.download".to_string()),
             progress: 3,
             message: format!("Downloading dependency: {file_name}"),
         });
@@ -614,7 +614,7 @@ fn parse_progress(output: &str) -> Option<HardeningProgress> {
         }
         return Some(HardeningProgress {
             stage: "init".to_string(),
-            substage: None,
+            substage: Some("toolchain.download".to_string()),
             progress,
             message: format!("Downloading {file_name} ({progress}%)"),
         });
@@ -623,7 +623,7 @@ fn parse_progress(output: &str) -> Option<HardeningProgress> {
     if output.contains("[toolchain] download-retry") {
         return Some(HardeningProgress {
             stage: "init".to_string(),
-            substage: None,
+            substage: Some("toolchain.download".to_string()),
             progress: 6,
             message: "Network unstable, retrying dependency download...".to_string(),
         });
@@ -636,7 +636,7 @@ fn parse_progress(output: &str) -> Option<HardeningProgress> {
             .unwrap_or("dependency");
         return Some(HardeningProgress {
             stage: "init".to_string(),
-            substage: None,
+            substage: Some("toolchain.download".to_string()),
             progress: 30,
             message: format!("Dependency ready: {file_name}"),
         });
@@ -784,5 +784,34 @@ mod tests {
         assert!(progress.substage.is_none());
         assert_eq!(progress.progress, 90);
         assert_eq!(progress.message, "Signing package");
+    }
+
+    #[test]
+    fn parse_progress_maps_toolchain_download_start_to_substage() {
+        let line = "[toolchain] download-start commandlinetools.zip 12345";
+        let progress = super::parse_progress(line).expect("progress should parse");
+        assert_eq!(progress.stage, "init");
+        assert_eq!(progress.substage.as_deref(), Some("toolchain.download"));
+    }
+
+    #[test]
+    fn parse_progress_maps_toolchain_download_progress_to_substage() {
+        let line = "[toolchain] download-progress commandlinetools.zip 37%";
+        let progress = super::parse_progress(line).expect("progress should parse");
+        assert_eq!(progress.stage, "init");
+        assert_eq!(progress.substage.as_deref(), Some("toolchain.download"));
+    }
+
+    #[test]
+    fn parse_progress_maps_toolchain_download_retry_and_done_to_substage() {
+        let retry = "[toolchain] download-retry commandlinetools.zip";
+        let retry_progress = super::parse_progress(retry).expect("retry should parse");
+        assert_eq!(retry_progress.stage, "init");
+        assert_eq!(retry_progress.substage.as_deref(), Some("toolchain.download"));
+
+        let done = "[toolchain] download-done commandlinetools.zip";
+        let done_progress = super::parse_progress(done).expect("done should parse");
+        assert_eq!(done_progress.stage, "init");
+        assert_eq!(done_progress.substage.as_deref(), Some("toolchain.download"));
     }
 }
