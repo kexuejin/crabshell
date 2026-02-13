@@ -1,13 +1,21 @@
 # CrabShell 🦀 (Android Packer)
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Build Status](https://github.com/your-username/kapp-shield/actions/workflows/build.yml/badge.svg)
+![Build Status](https://github.com/kexuejin/crabshell/actions/workflows/build.yml/badge.svg)
 ![Rust](https://img.shields.io/badge/rust-1.70%2B-orange)
 ![Android](https://img.shields.io/badge/android-API%2024%2B-green)
 
-CrabShell involves a custom Android Packer solution designed to protect Android applications (APK) by encrypting their DEX files and native libraries. It features a Rust-based host packer and an Android client shell that decrypts and loads the payload in memory at runtime.
+CrabShell is an Android app hardening toolkit for APK/AAB pipelines. It encrypts DEX and native libraries, patches runtime bootstrap components, and supports end-to-end packing/signing with Rust + Python + Android shell runtime.
 
-**[中文文档](README_CN.md)** (Coming Soon)
+Use this project if you need:
+- APK/AAB hardening automation in CI/CD.
+- Runtime DEX/native payload decryption and loading.
+- A research-oriented Android protection pipeline with source code.
+
+Recommended GitHub repository description:
+`Android APK/AAB hardening toolkit with Rust packer, encrypted DEX/native payload, and shell runtime bootstrap.`
+
+**[中文文档](README_CN.md)**
 
 ## Features
 
@@ -85,7 +93,7 @@ python3 pack.py
 
 1.  **Clone the repository**:
     ```bash
-    git clone https://github.com/your-username/crabshell.git
+    git clone https://github.com/kexuejin/crabshell.git
     cd crabshell
     ```
 
@@ -148,6 +156,12 @@ Workflow: `.github/workflows/build.yml`
   - Or manual trigger: `workflow_dispatch` with inputs: `tag`, `prerelease`
   - Publishes `.dmg`, `.deb`, `.AppImage`, `.msi`, `.exe` to GitHub Releases
   - Release assets are normalized as `CrabShell-<tag>-<original-file-name>`
+
+## Recommended GitHub Topics
+
+Add these topics in repository **About → Topics**:
+
+`android`, `android-security`, `mobile-security`, `apk`, `aab`, `app-hardening`, `obfuscation`, `dex`, `dex-encryption`, `jni`, `rust`, `tauri`, `apktool`, `reverse-engineering`, `application-security`
 
 ## Disclaimer
 
